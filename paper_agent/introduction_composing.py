@@ -244,20 +244,46 @@ Output the revised introduction section incorporating all these improvements. Re
 
         return final_introduction
 
-async def introduction_composing(research_field: str, instance_id: str):
+async def introduction_composing(
+    research_field: str, 
+    instance_id: str,
+    base_input_dir: str,
+    research_agent_workplace: str, # Not directly used by this composer, but kept for consistency
+    research_agent_model_name: str, # Not directly used by this composer, but kept for consistency
+    research_agent_run_workplace: str, # Not directly used by this composer, but kept for consistency
+    is_idea_run: bool
+):
     setup_logging(research_field)
     
     composer = IntroductionComposer(research_field=research_field, structure_iterations=1)
     
-    # target_paper = 'Heterogeneous Graph Contrastive Learning for Recommendation'
-    # benchmark_path = '../benchmark_collection/advance_graph/merged_papers_with_fields.json'
-    benchmark_path = f"/data2/tjb/Inno-agent/benchmark/final/{research_field}/{instance_id}.json"
+    instance_id_for_paths = f"{instance_id}_idea" if is_idea_run else instance_id
+    # sanitized_model_name is not used here as agent/model dirs are not directly accessed
+
+    benchmark_file_path = os.path.join(
+        base_input_dir, 
+        "benchmark", 
+        "final", 
+        research_field, 
+        f"{instance_id}.json"
+    )
+    
     try:
-        introduction = await composer.compose_section(benchmark_path, instance_id)
+        introduction = await composer.compose_section(benchmark_file_path, instance_id_for_paths)
         logging.info("Introduction composition completed")
     except Exception as e:
         logging.error(f"Error during introduction composition: {str(e)}")
         raise
 
 if __name__ == "__main__":
-    asyncio.run(introduction_composing())
+    # Example usage (update with appropriate values if direct execution is needed):
+    # asyncio.run(introduction_composing(
+    #     research_field="your_research_field",
+    #     instance_id="your_instance_id",
+    #     base_input_dir="./",
+    #     research_agent_workplace="workplace_paper", # Or appropriate value
+    #     research_agent_model_name="gpt-4o-2024-08-06", # Or appropriate value
+    #     research_agent_run_workplace="workplace", # Or appropriate value
+    #     is_idea_run=False
+    # ))
+    pass

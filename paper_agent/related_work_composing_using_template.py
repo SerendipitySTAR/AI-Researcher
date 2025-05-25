@@ -272,29 +272,63 @@ Output the revised related work section incorporating all these improvements. Re
 
         return final_related_work
 
-async def related_work_composing(research_field: str, instance_id: str):
+async def related_work_composing(
+    research_field: str, 
+    instance_id: str,
+    base_input_dir: str,
+    research_agent_workplace: str,
+    research_agent_model_name: str,
+    research_agent_run_workplace: str,
+    is_idea_run: bool
+):
     setup_logging(research_field)
     
     composer = RelatedWorkComposer(research_field=research_field, structure_iterations=1)
     
-    proj_dir = f'/data2/tjb_share/{research_field}/{instance_id}/'
-    # target_paper = "Knowledge Graph Self-Supervised Rationalization for Recommendation"
-    # target_paper = 'Heterogeneous Graph Contrastive Learning for Recommendation'
-    cache_dirs = [d for d in os.listdir(proj_dir) if d.startswith('cache_')]
-    if not cache_dirs:
-        raise ValueError("No cache directory found")
-    agent_dir = os.path.join(proj_dir, cache_dirs[-1], 'agents')
+    instance_id_for_paths = f"{instance_id}_idea" if is_idea_run else instance_id
+    sanitized_model_name = research_agent_model_name.replace("/", "__")
+
+    agent_dir_path = os.path.join(
+        base_input_dir, 
+        research_agent_workplace, 
+        f"cache_{instance_id_for_paths}_{sanitized_model_name}", 
+        "agents"
+    )
     
-    benchmark_path = f'/data2/tjb/Inno-agent/benchmark/final/{research_field}/{instance_id}.json'
-    papers_dir = os.path.join(proj_dir, 'workplace', 'papers')
+    # Path for related papers, assuming a similar structure to model_dir but for 'papers'
+    papers_dir_path = os.path.join(
+        base_input_dir,
+        research_agent_workplace,
+        f"task_{instance_id_for_paths}_{sanitized_model_name}",
+        research_agent_run_workplace, # This corresponds to the 'workplace' part in the original path
+        "papers" 
+    )
+    
+    benchmark_file_path = os.path.join(
+        base_input_dir, 
+        "benchmark", 
+        "final", 
+        research_field, 
+        f"{instance_id}.json"
+    )
     
     try:
         related_work = await composer.compose_section(
-            agent_dir, papers_dir, benchmark_path, instance_id)
+            agent_dir_path, papers_dir_path, benchmark_file_path, instance_id_for_paths)
         logging.info("Related work composition completed")
     except Exception as e:
         logging.error(f"Error during related work composition: {str(e)}")
         raise
 
 if __name__ == "__main__":
-    asyncio.run(related_work_composing())
+    # Example usage (update with appropriate values if direct execution is needed):
+    # asyncio.run(related_work_composing(
+    #     research_field="your_research_field",
+    #     instance_id="your_instance_id",
+    #     base_input_dir="./",
+    #     research_agent_workplace="workplace_paper",
+    #     research_agent_model_name="gpt-4o-2024-08-06",
+    #     research_agent_run_workplace="workplace",
+    #     is_idea_run=False
+    # ))
+    pass

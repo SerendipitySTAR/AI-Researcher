@@ -177,18 +177,39 @@ Output the revised conclusion section incorporating all these improvements. Repl
 
         return final_conclusion
 
-async def conclusion_composing(research_field: str, instance_id: str):
+async def conclusion_composing(
+    research_field: str, 
+    instance_id: str,
+    base_input_dir: str, # Not directly used by this composer for path construction
+    research_agent_workplace: str, # Not directly used by this composer
+    research_agent_model_name: str, # Not directly used by this composer
+    research_agent_run_workplace: str, # Not directly used by this composer
+    is_idea_run: bool
+):
     setup_logging(research_field)
     
     composer = ConclusionComposer(research_field=research_field, structure_iterations=2)
-    # target_paper = 'Heterogeneous Graph Contrastive Learning for Recommendation'
     
+    instance_id_for_paths = f"{instance_id}_idea" if is_idea_run else instance_id
+    # Other path components like sanitized_model_name are not needed here as
+    # this composer relies on previously generated sections, not direct file inputs.
+
     try:
-        conclusion = await composer.compose_section(instance_id)
+        conclusion = await composer.compose_section(instance_id_for_paths)
         logging.info("Conclusion composition completed")
     except Exception as e:
         logging.error(f"Error during conclusion composition: {str(e)}")
         raise
 
 if __name__ == "__main__":
-    asyncio.run(conclusion_composing())
+    # Example usage (update with appropriate values if direct execution is needed):
+    # asyncio.run(conclusion_composing(
+    #     research_field="your_research_field",
+    #     instance_id="your_instance_id",
+    #     base_input_dir="./", # Or appropriate value
+    #     research_agent_workplace="workplace_paper", # Or appropriate value
+    #     research_agent_model_name="gpt-4o-2024-08-06", # Or appropriate value
+    #     research_agent_run_workplace="workplace", # Or appropriate value
+    #     is_idea_run=False
+    # ))
+    pass
