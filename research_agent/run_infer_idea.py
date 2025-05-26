@@ -1,6 +1,10 @@
 import json
+import os # Make sure os is imported for file path checks
+import sys
+# Ensure research_agent.inno.interaction_utils can be imported.
+from research_agent.inno.interaction_utils import present_text_to_user_for_review, present_choices_to_user, manage_code_review_session # Import new utility
 from research_agent.inno.workflow.flowcache import FlowModule, ToolModule, AgentModule
-from research_agent.inno.tools.inno_tools.paper_search import get_arxiv_paper_meta
+from research_agent.inno.tools.inno_tools.paper_search import get_arxiv_paper_meta, find_official_code_for_paper # Import new tool
 from research_agent.inno.tools.inno_tools.code_search import search_github_repos, search_github_code
 from research_agent.inno.agents.inno_agent.plan_agent import get_coding_plan_agent
 from research_agent.inno.agents.inno_agent.prepare_agent import get_prepare_agent
@@ -112,6 +116,9 @@ class InnoFlow(FlowModule):
         self.code_survey_agent = AgentModule(get_code_survey_agent(model=CHEEP_MODEL, file_env=file_env, code_env=code_env), self.client, cache_path)
         self.exp_analyser = AgentModule(get_exp_analyser_agent(model=CHEEP_MODEL, file_env=file_env, code_env=code_env), self.client, cache_path)
     async def forward(self, instance_path: str, task_level: str, local_root: str, workplace_name: str, max_iter_times: int, category: str, *args, **kwargs):
+        project_path_in_docker = f"/{workplace_name}/project"
+        host_code_review_base_dir = os.path.abspath("./temp_human_code_review_sessions")
+
         metadata = self.load_ins({"instance_path": instance_path, "task_level": task_level})
         context_variables = {
             "working_dir": workplace_name, # TODO: change to the codebase path
@@ -121,6 +128,90 @@ class InnoFlow(FlowModule):
         github_result = self.git_search({"metadata": metadata})
         data_module = importlib.import_module(f"benchmark.process.dataset_candidate.{category}.metaprompt")
 
+        # Step 2: Gather Code Links (Revised Strategy)
+        compiled_code_links_for_prompt = []
+        for paper_info in metadata["source_papers"]:
+            title = paper_info.get("reference", "Unknown Title")
+            user_link = paper_info.get("github_link") # New optional field from benchmark JSON
+
+            if user_link:
+                # Ensure user_link is treated as a single link, not a list
+                compiled_code_links_for_prompt.append(f"- Paper: '{title}', User-Provided Link: {user_link} (Source: User Input)")
+            else:
+                paper_arxiv_url = paper_info.get("url") # URL for the specific paper from benchmark JSON
+                if paper_arxiv_url:
+                    # find_official_code_for_paper returns a list of dicts
+                    tool_links = find_official_code_for_paper(paper_title=title, arxiv_url=paper_arxiv_url)
+                    if tool_links:
+                        for link_info in tool_links:
+                            compiled_code_links_for_prompt.append(f"- Paper: '{title}', Tool-Discovered Link: {link_info['url']} (Source: {link_info['source_description']})")
+                    else:
+                        compiled_code_links_for_prompt.append(f"- Paper: '{title}', Tool-Discovered Link: None found in arXiv metadata.")
+                else:
+                    # If no user_link and no paper_arxiv_url, we cannot find specific links for this paper_info item.
+                    compiled_code_links_for_prompt.append(f"- Paper: '{title}', Official Link: None provided or found (no user link, no arXiv URL for tool search).")
+        
+        official_links_presentation_str = "\n".join(compiled_code_links_for_prompt)
+        if not compiled_code_links_for_prompt:
+            official_links_presentation_str = "No user-provided or tool-discovered official code links were processed for the source papers."
+
+        # In run_infer_idea.py, PrepareAgent is called before the specific innovative idea is fully formed by the user.
+        # The task_description should guide the PrepareAgent to select broadly useful codebases.
+        task_description_for_prepare_agent = (
+            "Your primary task is to identify and select highly relevant and valuable code repositories "
+            "that could serve as foundational references for a potential research project in the domain "
+            "covered by the source papers. The specific innovative idea will be developed after this step. "
+            "Therefore, focus on selecting codebases that are either official implementations of the source papers, "
+            "high-quality implementations of core concepts, or provide useful tools/datasets for this research area."
+        )
+
+        query_for_prepare_agent = f"""\
+You are tasked with selecting reference codebases for a potential research project.
+{task_description_for_prepare_agent}
+
+Your selection should be based on the following information, presented in order of preference for your consideration:
+
+1.  **User-Provided and Tool-Discovered Official Code Links:**
+    (These are links explicitly provided by the user in the benchmark or discovered from paper metadata. They should be prioritized if relevant.)
+{official_links_presentation_str}
+
+2.  **General GitHub Search Results:**
+    (These are broader search results based on paper titles. Use these to supplement if the official links are insufficient or to find alternatives.)
+{github_result}
+
+3.  **List of Source Papers (for context):**
+{warp_source_papers(metadata["source_papers"])}
+
+**Instructions for Selecting Code Repositories:**
+-   Carefully review all provided information.
+-   **Prioritization Strategy:**
+    1.  Strongly prioritize **User-Provided Links** (from 'User Input' source).
+    2.  Next, carefully consider **Tool-Discovered Official Links** (from 'arXiv comment section', 'arXiv summary/abstract', etc.).
+    3.  Finally, use **General GitHub Search Results** to find alternatives or if the above sources yield insufficient relevant repositories.
+-   For each link, assess its relevance to the general research area of the source papers and its potential utility for a new project in this domain.
+-   You must choose at least 5 repositories in total.
+-   For each chosen repository, when calling the `case_resolved` function, you MUST specify:
+    -   `url`: (string) The URL of the repository.
+    -   `source_type`: (string) Must be one of 'user_provided_official', 'tool_discovered_official', or 'github_search'. Base this on how you primarily identified the relevance of this specific URL.
+    -   `reasoning`: (string) Your detailed justification for why this repository was selected.
+    -   `cloned_path`: (string, optional) If you decide to clone the repository, provide the name of the directory you cloned it into (e.g., 'user_repo_name'). If not cloned, this can be omitted or be an empty string.
+
+Based on your review, provide a list of the chosen reference codebases using the `case_resolved` function with the specified structure for each repository.
+"""
+        messages = [{"role": "user", "content": query_for_prepare_agent}]
+        prepare_messages, context_variables = await self.prepare_agent(messages, context_variables)
+        prepare_res = prepare_messages[-1]["content"] # This is the JSON string from case_resolved
+
+        # TeX paper downloading remains decoupled.
+        source_paper_titles_for_tex = [p.get("reference", "") for p in metadata["source_papers"] if p.get("reference")]
+        source_paper_titles_for_tex = [title for title in source_paper_titles_for_tex if title.strip()]
+        
+        download_res = self.download_papaer({
+            "paper_list": source_paper_titles_for_tex, 
+            "local_root": local_root, 
+            "workplace_name": workplace_name
+        })
+        
         dataset_description = f"""\
 You should select SEVERAL datasets as experimental datasets from the following description:
 {data_module.DATASET}
@@ -136,24 +227,6 @@ And the evaluation metrics are:
 
 {data_module.REF}
 """
-        
-        query = f"""\
-You are given a list of papers, searching results of the papers on GitHub. 
-List of papers:
-{warp_source_papers(metadata["source_papers"])}
-
-Searching results of the papers on GitHub:
-{github_result}
-
-Your task is to choose at least 5 repositories as the reference codebases. Note that this time there is no innovative ideas, you should choose the most valuable repositories as the reference codebases.
-"""
-        messages = [{"role": "user", "content": query}]
-        prepare_messages, context_variables = await self.prepare_agent(messages, context_variables)
-        prepare_res = prepare_messages[-1]["content"]
-        prepare_dict = extract_json_from_output(prepare_res)
-        paper_list = prepare_dict["reference_papers"]
-        download_res = self.download_papaer({"paper_list": paper_list, "local_root": local_root, "workplace_name": workplace_name})
-
         
         idea_query = f"""\
 I have a task related to machine learning:
@@ -191,7 +264,77 @@ Your task is to analyze multiple existing ideas, select the most novel one, enha
 """.format(IDEA_NUM, '\n===================\n==================='.join(ideas))}]
         survey_messages, context_variables = await self.idea_agent(messages, context_variables, iter_times="select")
         survey_res = survey_messages[-1]["content"]
-        # print(survey_res)
+        
+        print("\n=== LLM has selected and refined an idea. User review requested. ===")
+        
+        choice_prompts = []
+        full_idea_contents = []
+
+        # Use chr(10) for newline within f-string expressions to avoid issues with backslashes
+        choice_prompts.append(f"Review/Approve LLM's Refined Idea (Snippet: {survey_res[:200].replace(chr(10), ' ')}...)")
+        full_idea_contents.append(survey_res)
+
+        for i, idea_text in enumerate(ideas):
+            choice_prompts.append(f"Review/Approve Original Idea {i+1} (Snippet: {idea_text[:200].replace(chr(10), ' ')}...)")
+            full_idea_contents.append(idea_text)
+
+        custom_path_option_text = "Provide path to a custom/edited idea file"
+        custom_console_option_text = "Input custom/edited idea directly via console"
+        choice_prompts.append(custom_path_option_text)
+        choice_prompts.append(custom_console_option_text)
+
+        selected_idea_content = None
+
+        while selected_idea_content is None:
+            main_prompt_for_choice = "\nPlease select an option for the research idea:"
+            chosen_option_str, chosen_idx = present_choices_to_user(main_prompt_for_choice, choice_prompts)
+
+            if chosen_idx is not None: # User selected one of the numbered options
+                if 0 <= chosen_idx < len(full_idea_contents): # Index corresponds to an existing idea
+                    idea_to_review = full_idea_contents[chosen_idx]
+                    file_sugg_name = "llm_refined_idea.txt" if chosen_idx == 0 else f"original_idea_{chosen_idx}.txt"
+                    
+                    print(f"\nReviewing: {choice_prompts[chosen_idx]}")
+                    edited_content = present_text_to_user_for_review(
+                        content=idea_to_review, 
+                        file_name_suggestion=file_sugg_name,
+                        prompt_message="The full text of the selected idea has been saved for your review.",
+                        edit_prompt="[A]pprove this idea as is, or [E]dit the saved file and use your version?"
+                    )
+                    if edited_content is not None:
+                        selected_idea_content = edited_content
+                    else:
+                        print("Review process was cancelled or an error occurred. Please choose an option again.")
+                # This case should ideally not be reached if chosen_idx is not None and choice_prompts is consistent
+                # else: 
+                #    print("Internal error: chosen_idx out of sync. Please try again.")
+
+            elif chosen_option_str == custom_path_option_text:
+                custom_file_path = input("Please enter the full path to your custom/edited idea file: ").strip()
+                if custom_file_path and os.path.exists(custom_file_path):
+                    try:
+                        with open(custom_file_path, 'r', encoding='utf-8') as f: selected_idea_content = f.read()
+                        print(f"Loaded idea from {custom_file_path}")
+                    except Exception as e: print(f"Error reading file {custom_file_path}: {e}. Please try again.")
+                elif not custom_file_path: print("No file path provided. Please try again.")
+                else: print(f"File not found: {custom_file_path}. Please try again.")
+            
+            elif chosen_option_str == custom_console_option_text:
+                print("Please paste your custom/edited idea. Press Ctrl+D (Unix) or Ctrl+Z then Enter (Windows) when done to submit.")
+                custom_idea_lines = []
+                try:
+                    while True: custom_idea_lines.append(input())
+                except EOFError: pass # Expected way to end multi-line input
+                custom_idea = "\n".join(custom_idea_lines)
+                if custom_idea.strip():
+                    selected_idea_content = custom_idea; print("Custom idea captured.")
+                else: print("No input received or input was empty. Please try again.")
+            else: 
+                print("Invalid selection or process aborted. Please try again.")
+
+        survey_res = selected_idea_content 
+        print("\n--- User idea selection complete. Proceeding with the chosen idea. ---")
+        # print(survey_res) # Original print statement for survey_res
 
         code_survey_query = f"""\
 I have an innovative idea related to machine learning:
@@ -232,6 +375,21 @@ Your task is to carefully review the existing resources and understand the task,
         messages = [{"role": "user", "content": plan_query}]
         plan_messages, context_variables = await self.coding_plan_agent(messages, context_variables)
         plan_res = plan_messages[-1]["content"]
+
+        print("\n=== Coding plan generated. User review requested. ===")
+        edited_plan_res = present_text_to_user_for_review(
+            content=plan_res,
+            file_name_suggestion="coding_plan_for_review.md", # Suggest markdown for better readability if plan is structured text
+            prompt_message="The generated coding plan has been saved for your review.",
+            edit_prompt="[A]pprove this plan as is, or [E]dit the saved file and use your version?"
+        )
+
+        if edited_plan_res is not None:
+            plan_res = edited_plan_res
+            print("\n--- User plan validation complete. Proceeding with the approved/edited plan. ---")
+        else:
+            print("\n--- Plan review was cancelled or an error occurred. Halting execution. ---")
+            raise SystemExit("Execution halted due to plan review cancellation or error.")
 
         # write the model based on the model survey notes
         ml_dev_query = f"""\
@@ -354,6 +512,18 @@ Remember:
         ml_dev_messages, context_variables = await self.ml_agent(messages, context_variables)
         ml_dev_res = ml_dev_messages[-1]["content"]
 
+        print("\n=== Initial code generated by MLAgent. Human review requested. ===")
+        review_completed_initial = manage_code_review_session(
+            docker_env=self.code_env, 
+            project_path_in_docker=project_path_in_docker,
+            host_review_dir_base=host_code_review_base_dir,
+            session_id_prefix="initial_code_review_idea" # Unique prefix for idea run
+        )
+        if not review_completed_initial:
+            print("Error during initial human code review. Halting execution.")
+            raise SystemExit("Execution halted due to initial code review error or cancellation.")
+        print("--- Initial human code review session concluded. Proceeding to JudgeAgent. ---")
+
         query = f"""\
 INPUT:
 You are given an innovative idea:
@@ -384,6 +554,20 @@ Your task is to evaluate the implementation, and give a suggestion about the imp
 
         MAX_ITER_TIMES = max_iter_times
         for i in range(MAX_ITER_TIMES):
+            print(f"\n=== Iteration {i+1}/{MAX_ITER_TIMES}: JudgeAgent feedback received. Human review requested before MLAgent refinement (Idea Run). ===")
+            review_completed_iterative = manage_code_review_session(
+                docker_env=self.code_env,
+                project_path_in_docker=project_path_in_docker,
+                host_review_dir_base=host_code_review_base_dir,
+                session_id_prefix=f"refinement_loop_idea_iter_{i+1}" # Unique prefix for idea run
+            )
+            if not review_completed_iterative:
+                print(f"Error during iterative human code review (iteration {i+1}). Halting execution.")
+                raise SystemExit(f"Execution halted due to iterative code review error or cancellation at iteration {i+1}.")
+            
+            human_edit_note = "Note: Human has reviewed and potentially modified the code after the last JudgeAgent's feedback. Please consider these human modifications alongside the JudgeAgent's feedback when making your next set of changes. Prioritize human modifications if they conflict with the JudgeAgent's suggestions for the same code sections, but still address other valid points from JudgeAgent if applicable."
+            print(f"--- Iterative human code review session (iteration {i+1}, Idea Run) concluded. ---")
+            
             query = f"""\
 You are given an innovative idea:
 {survey_res}
@@ -414,6 +598,7 @@ Remember:
 - MUST use actual dataset (no toy data)
 - MUST complete 2 epochs of training and testing
 """
+            query = human_edit_note + "\n\n" + query # Prepend the human edit note
             judge_messages.append({"role": "user", "content": query})
             judge_messages, context_variables = await self.ml_agent(judge_messages, context_variables, iter_times=i+1)
             ml_dev_res = judge_messages[-1]["content"]

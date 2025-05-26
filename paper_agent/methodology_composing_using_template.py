@@ -7,6 +7,8 @@ import sys
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from utils.openai_utils import GPTClient
 from section_composer import SectionComposer, setup_logging
+from .interaction_utils import present_text_to_user_for_review
+# import os # os is already imported
 
 class MethodologyComposer(SectionComposer):
     def __init__(self, research_field: str, structure_iterations: int = 3):
@@ -294,6 +296,28 @@ Output the revised methodology section incorporating all these improvements whil
         fused_methodology = await self.fuse_subsections(structure, subsection_contents)
         self.write_temp_log(fused_methodology, "post_fusion_methodology")
 
+        print("\n=== Methodology section draft composed. User review requested. ===")
+        # Ensure target_paper (instance_id_for_paths) is available here for filename suggestion.
+        # It's a parameter to compose_section.
+        file_suggestion = f"{self.normalize_title(target_paper)}_methodology_draft_for_review.tex"
+        
+        reviewed_fused_methodology = present_text_to_user_for_review(
+            content=fused_methodology,
+            file_name_suggestion=file_suggestion,
+            prompt_message=f"The draft for the '{self.section_name}' section has been saved.",
+            edit_prompt="[A]pprove this draft, or [E]dit the saved file and use your version?"
+        )
+
+        if reviewed_fused_methodology is None:
+            logging.error(f"User cancelled review or an error occurred during review for {self.section_name} of {target_paper}. Halting composition for this section.")
+            # Option 1: Raise an exception
+            raise SystemExit(f"Composition of {self.section_name} for {target_paper} halted due to review cancellation.")
+            # Option 2: Return empty or indicate failure (less disruptive if one section fails in a batch)
+            # return "" # Or a more specific error indicator
+
+        fused_methodology = reviewed_fused_methodology # Use the approved/edited content
+        logging.info(f"User review for {self.section_name} of {target_paper} complete. Proceeding with final checklist.")
+
         # Step 4: Final writing checklist
         final_methodology = await self.final_writing_checklist(fused_methodology)
         self.write_temp_log(final_methodology, "post_checklist_methodology")
@@ -309,31 +333,63 @@ Output the revised methodology section incorporating all these improvements whil
 
         return final_methodology
 
-async def methodology_composing(research_field: str, instance_id: str):
-    # research_field = "vq"
-    # instance_id = "rotation_vq"
+async def methodology_composing(
+    research_field: str, 
+    instance_id: str,
+    base_input_dir: str,
+    research_agent_workplace: str,
+    research_agent_model_name: str,
+    research_agent_run_workplace: str,
+    is_idea_run: bool
+):
     setup_logging(research_field)
     
     composer = MethodologyComposer(research_field=research_field, structure_iterations=1)
     
-    proj_dir = f'/data2/tjb_share/{research_field}/{instance_id}/'
-    # target_paper = "Knowledge Graph Self-Supervised Rationalization for Recommendation"
-    # target_paper = 'Heterogeneous Graph Contrastive Learning for Recommendation'
-    cache_dirs = [d for d in os.listdir(proj_dir) if d.startswith('cache_')]
-    if not cache_dirs:
-        raise ValueError("No cache directory found")
-    agent_dir = os.path.join(proj_dir, cache_dirs[-1], 'agents')
+    instance_id_for_paths = f"{instance_id}_idea" if is_idea_run else instance_id
+    sanitized_model_name = research_agent_model_name.replace("/", "__")
+
+    agent_dir_path = os.path.join(
+        base_input_dir, 
+        research_agent_workplace, 
+        f"cache_{instance_id_for_paths}_{sanitized_model_name}", 
+        "agents"
+    )
     
-    model_dir = os.path.join(proj_dir, 'workplace/project/model/')
-    benchmark_path = f'/data2/tjb/Inno-agent/benchmark/final/{research_field}/{instance_id}.json'
+    model_dir_path = os.path.join(
+        base_input_dir,
+        research_agent_workplace,
+        f"task_{instance_id_for_paths}_{sanitized_model_name}",
+        research_agent_run_workplace,
+        "project",
+        "model"
+    )
+    
+    benchmark_file_path = os.path.join(
+        base_input_dir, 
+        "benchmark", 
+        "final", 
+        research_field, 
+        f"{instance_id}.json"
+    )
     
     try:
         methodology = await composer.compose_section(
-            agent_dir, model_dir, benchmark_path, instance_id)
+            agent_dir_path, model_dir_path, benchmark_file_path, instance_id_for_paths)
         logging.info("Methodology composition completed")
     except Exception as e:
         logging.error(f"Error during methodology composition: {str(e)}")
         raise
 
 if __name__ == "__main__":
-    asyncio.run(methodology_composing())
+    # Example usage (update with appropriate values if direct execution is needed):
+    # asyncio.run(methodology_composing(
+    #     research_field="your_research_field",
+    #     instance_id="your_instance_id",
+    #     base_input_dir="./",
+    #     research_agent_workplace="workplace_paper",
+    #     research_agent_model_name="gpt-4o-2024-08-06",
+    #     research_agent_run_workplace="workplace",
+    #     is_idea_run=False
+    # ))
+    pass

@@ -7,6 +7,8 @@ import sys
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from utils.openai_utils import GPTClient
 from section_composer import SectionComposer, setup_logging
+from .interaction_utils import present_text_to_user_for_review
+# import logging # logging is already imported
 
 class IntroductionComposer(SectionComposer):
     def __init__(self, research_field: str, structure_iterations: int = 3):
@@ -229,6 +231,23 @@ Output the revised introduction section incorporating all these improvements. Re
             
         self.write_temp_log(introduction, "initial_introduction")
 
+        print(f"\n=== {self.section_name.capitalize()} section draft composed. User review requested. ===")
+        file_suggestion = f"{self.normalize_title(target_paper)}_{self.section_name}_draft_for_review.tex"
+        
+        reviewed_draft_content = present_text_to_user_for_review(
+            content=introduction, # Variable holding the current section's draft
+            file_name_suggestion=file_suggestion,
+            prompt_message=f"The draft for the '{self.section_name}' section has been saved.",
+            edit_prompt="[A]pprove this draft, or [E]dit the saved file and use your version?"
+        )
+
+        if reviewed_draft_content is None:
+            logging.error(f"User cancelled review or an error occurred during review for {self.section_name} of {target_paper}. Halting composition for this section.")
+            raise SystemExit(f"Composition of {self.section_name} for {target_paper} halted due to review cancellation.")
+
+        introduction = reviewed_draft_content # Use the approved/edited content for subsequent steps
+        logging.info(f"User review for {self.section_name} of {target_paper} complete. Proceeding with final processing.")
+
         # Step 3: Final writing checklist
         final_introduction = await self.final_writing_checklist(introduction)
         self.write_temp_log(final_introduction, "final_introduction")
@@ -244,20 +263,46 @@ Output the revised introduction section incorporating all these improvements. Re
 
         return final_introduction
 
-async def introduction_composing(research_field: str, instance_id: str):
+async def introduction_composing(
+    research_field: str, 
+    instance_id: str,
+    base_input_dir: str,
+    research_agent_workplace: str, # Not directly used by this composer, but kept for consistency
+    research_agent_model_name: str, # Not directly used by this composer, but kept for consistency
+    research_agent_run_workplace: str, # Not directly used by this composer, but kept for consistency
+    is_idea_run: bool
+):
     setup_logging(research_field)
     
     composer = IntroductionComposer(research_field=research_field, structure_iterations=1)
     
-    # target_paper = 'Heterogeneous Graph Contrastive Learning for Recommendation'
-    # benchmark_path = '../benchmark_collection/advance_graph/merged_papers_with_fields.json'
-    benchmark_path = f"/data2/tjb/Inno-agent/benchmark/final/{research_field}/{instance_id}.json"
+    instance_id_for_paths = f"{instance_id}_idea" if is_idea_run else instance_id
+    # sanitized_model_name is not used here as agent/model dirs are not directly accessed
+
+    benchmark_file_path = os.path.join(
+        base_input_dir, 
+        "benchmark", 
+        "final", 
+        research_field, 
+        f"{instance_id}.json"
+    )
+    
     try:
-        introduction = await composer.compose_section(benchmark_path, instance_id)
+        introduction = await composer.compose_section(benchmark_file_path, instance_id_for_paths)
         logging.info("Introduction composition completed")
     except Exception as e:
         logging.error(f"Error during introduction composition: {str(e)}")
         raise
 
 if __name__ == "__main__":
-    asyncio.run(introduction_composing())
+    # Example usage (update with appropriate values if direct execution is needed):
+    # asyncio.run(introduction_composing(
+    #     research_field="your_research_field",
+    #     instance_id="your_instance_id",
+    #     base_input_dir="./",
+    #     research_agent_workplace="workplace_paper", # Or appropriate value
+    #     research_agent_model_name="gpt-4o-2024-08-06", # Or appropriate value
+    #     research_agent_run_workplace="workplace", # Or appropriate value
+    #     is_idea_run=False
+    # ))
+    pass

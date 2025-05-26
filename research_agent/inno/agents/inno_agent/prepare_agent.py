@@ -6,57 +6,80 @@ from research_agent.inno.types import Result
 import json
 from inspect import signature
 from research_agent.inno.environment.docker_env import DockerEnv, with_env
+from typing import List, Dict, Optional # Added for type hinting
 
-def case_resolved(reference_codebases: list[str], reference_paths: list[str], reference_papers: list[str]):
+def case_resolved(selected_repositories: List[Dict[str, Optional[str]]]):
     """
     The function to output the determined reference codebases. Use this function only after you have carefully reviewed the existing resources and understand the task.
     Args:
-        reference_codebases: list of the name of the determined reference codebases.
-        reference_paths: list of the determined reference paths.
-        reference_papers: list of titles of the determined reference papers.
+        selected_repositories: A list of dictionaries. Each dictionary represents a chosen repository and should contain:
+            'url': (str) The URL of the repository.
+            'source_type': (str) Origin of the link, e.g., 'official_link' or 'github_search'.
+            'reasoning': (str) Justification for selecting this repository.
+            'cloned_path': (str, optional) The directory name if the repository was cloned (e.g., 'user_repo_name').
     """
     prepare_result = {
-        "reference_codebases": reference_codebases,
-        "reference_paths": reference_paths,
-        "reference_papers": reference_papers
+        "selected_code_repositories": selected_repositories
     }
 
     return Result(
         value=f"""\
-I have determined the reference codebases and paths according to the existing resources and the innovative ideas.
+I have determined the reference codebases based on official links and general search results.
 {json.dumps(prepare_result, ensure_ascii=False, indent=4)}
 """, 
         context_variables={"prepare_result": prepare_result}
     )
+
 @register_agent("get_prepare_agent")
 def get_prepare_agent(model: str, **kwargs):
     code_env: DockerEnv = kwargs.get("code_env", None)
     def instructions(context_variables):
       working_dir = context_variables.get("working_dir", None)
+      # The input to this agent (the user message) will contain:
+      # 1. The innovative idea/task description.
+      # 2. A list of source papers.
+      # 3. "User-Provided and Tool-Discovered Official Code Links".
+      # 4. "General GitHub Search Results".
       return f"""
-You are given a list of papers, searching results of the papers on GitHub, and innovative ideas according to the papers. Your working directory is `/{working_dir}`, you can only access files in this directory.
+You are tasked with selecting relevant reference codebases for a given research project.
+Your working directory is `/{working_dir}`. You can only access files within this directory.
 
-Your task is to go through the searching results, find out more detailed information about repositories in the searching results, and determine which repositories are the most relevant and useful to the innovative ideas. You can determine the relevance and usefulness by the following criteria:
-1. Repositories with more stars are more recommended.
-2. Repositories created more recently are more recommended, [IMPORTANT!] Too old repositories are not recommended.
-3. More detaild `README.md` file means more readable codebase and more reproducible, so more recommended.
-4. More clear code structure, code comments, and inline code explanations mean more readable codebase and more maintainable, so more recommended.
-5. I prefer repositories with `python` language, and running coding in the local machine rather than in docker. As for deep learning projects, I prefer `pytorch` framework.
+Input Information:
+You will receive the research project's innovative idea/task description, a list of source papers, a section detailing 'User-Provided and Tool-Discovered Official Code Links', and a section with 'General GitHub Search Results'.
 
-You should choose at least 5 repositories as the reference codebases.
+Your Task:
+1.  **Understand the Goal:** First, thoroughly understand the research project's innovative idea or task description. All selections must support this goal.
+2.  **Review Information Sources:** Examine all provided code link sources:
+    *   **User-Provided and Tool-Discovered Official Code Links:** These are listed with their original source (e.g., 'User Input', 'arXiv comment section').
+    *   **General GitHub Search Results:** Broader results based on paper titles.
+3.  **Prioritize and Investigate:**
+    *   **Highest Priority:** Start by investigating links labeled as 'User-Provided Link' (source: 'User Input'). These are direct suggestions.
+    *   **Second Priority:** Next, examine links labeled as 'Tool-Discovered Link' (sources like 'arXiv comment section', 'arXiv summary/abstract').
+    *   **Third Priority:** If the above sources do not yield enough relevant repositories, or if you need more options, explore the 'General GitHub Search Results'.
+    *   Use the provided tools (`execute_command git clone ...`, `gen_code_tree_structure`, `read_file`) to assess promising repositories.
+4.  **Select Repositories:** Choose at least 5 repositories in total that are most relevant and useful for implementing the innovative idea.
+5.  **Justify Selections:** For each repository you select, provide a detailed justification for your choice, explaining its relevance and potential utility.
 
-I should use the determined repositories as reference codebases to implement the innovative ideas, so your decision should be as accurate as possible, and the number of repositories should be as less as possible. 
+Evaluation Criteria for Repositories (consider these during your investigation):
+*   Relevance: How closely does the repository align with the innovative idea and the techniques mentioned in the source papers?
+*   Quality: Is the code well-structured, documented, and maintained? (Stars, recent updates, README quality are indicators).
+*   Completeness: Does it seem to be a full implementation or a partial one?
+*   Framework/Language: Python and PyTorch are preferred for deep learning projects, but consider others if highly relevant.
 
-During the decision process, you can use the following tools:
-1. You can use `execute_command` to git clone the repository to the working directory `/{working_dir}`. Choose 5-8 repositories you really need. And you should reserve the names of the repositories.
+Output Requirements:
+When you have made your final selections, you MUST use the `case_resolved` function.
+The `selected_repositories` argument for `case_resolved` must be a list of dictionaries. Each dictionary should have the following structure:
+  - 'url': (string) The URL of the repository.
+  - 'source_type': (string) Must be one of 'user_provided_official', 'tool_discovered_official', or 'github_search'. This should reflect how you primarily identified and verified the link's relevance (e.g., if a GitHub search result matches an official paper, and you verify it, you might still classify based on its initial discovery or how its relevance was confirmed).
+  - 'reasoning': (string) Your detailed justification for why this repository was selected.
+  - 'cloned_path': (string, optional) If you cloned the repository, provide the name of the directory you cloned it into (e.g., 'user_repo_name'). If not cloned, omit this key or set its value to None or an empty string.
 
-2. You can use `gen_code_tree_structure` to generate the tree structure of the code in the repository.
-
-3. You can use `read_file` to read the content of the file in the repository. Note that read `README.md` file can help you know the purpose and function of the code in the repository, and read other files can help you know the details of the implementation.
-
-4. You can use `terminal_page_down`, `terminal_page_up` and `terminal_page_to` to scroll the terminal output when it is too long. You can use `terminal_page_to` to move the viewport to the specific page of terminal where the meaningful content is, for example, when the terminal output contains a progress bar or output of generating directory structure when there are many datasets in the directory, you can use `terminal_page_to` to move the viewport to the end of terminal where the meaningful content is.
-
-4. Finally, you should use the function `case_resolved` to output the determined reference codebases.
+Tools Available:
+- `execute_command`: To clone repositories or run other useful commands.
+- `gen_code_tree_structure`: To view the structure of cloned repositories.
+- `read_file`: To read specific files from cloned repositories.
+- `terminal_page_down`, `terminal_page_up`, `terminal_page_to`: For navigating large terminal outputs.
+- `case_resolved`: To submit your final list of selected repositories with all required details.
       """
     tools = [gen_code_tree_structure, read_file, execute_command, case_resolved, terminal_page_down, terminal_page_up, terminal_page_to]
     tools = [with_env(code_env)(tool) if 'env' in signature(tool).parameters else tool for tool in tools]
