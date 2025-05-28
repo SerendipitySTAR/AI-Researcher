@@ -29,6 +29,15 @@ from typing import List, Dict, Any, Union
 from research_agent.inno.logger import MetaChainLogger
 import importlib
 from research_agent.inno.environment.utils import setup_dataset
+from research_agent.validation import validate_source_papers # Added
+from research_agent.intervention_utils import ( # Added
+    should_request_human_intervention,
+    get_estimated_code_quality_score, 
+    get_execution_success,
+    intelligent_stopping_condition # Added intelligent_stopping_condition
+)
+from research_agent.code_quality import CodeQualityChecker # Added
+from research_agent.unified_logging import UnifiedLogger # Added
 # instance_path = "benchmark/gnn.json"
 # task_level = "task1"
 def warp_source_papers(source_papers):
@@ -115,11 +124,31 @@ class InnoFlow(FlowModule):
         # self.survey_agent = AgentModule(get_survey_agent(model=CHEEP_MODEL, file_env=file_env, code_env=code_env), self.client, cache_path)
         self.code_survey_agent = AgentModule(get_code_survey_agent(model=CHEEP_MODEL, file_env=file_env, code_env=code_env), self.client, cache_path)
         self.exp_analyser = AgentModule(get_exp_analyser_agent(model=CHEEP_MODEL, file_env=file_env, code_env=code_env), self.client, cache_path)
+        self.code_checker = CodeQualityChecker(logger=self.logger) # Added
+        self.code_env = code_env # Added: Store code_env for pre_execution_check
+        self.unified_logger = UnifiedLogger(main_logger=self.logger) # Added
+
     async def forward(self, instance_path: str, task_level: str, local_root: str, workplace_name: str, max_iter_times: int, category: str, *args, **kwargs):
         project_path_in_docker = f"/{workplace_name}/project"
         host_code_review_base_dir = os.path.abspath("./temp_human_code_review_sessions")
 
         metadata = self.load_ins({"instance_path": instance_path, "task_level": task_level})
+
+        all_valid, validation_errors = validate_source_papers(metadata.get('source_papers', []))
+        if not all_valid:
+            error_str = "\n".join(validation_errors)
+            # Assuming self.logger is available from InnoFlow's __init__
+            if hasattr(self, 'logger') and self.logger is not None:
+                self.logger.error(f"Source papers validation failed in run_infer_idea.py:\n{error_str}")
+            else:
+                print(f"CRITICAL (run_infer_idea.py): Source papers validation failed:\n{error_str}")
+            raise SystemExit("Execution halted in run_infer_idea.py due to invalid source paper data.")
+        else:
+            if hasattr(self, 'logger') and self.logger is not None:
+                self.logger.info("Source papers validated successfully in run_infer_idea.py.")
+            else:
+                print("Source papers validated successfully in run_infer_idea.py.")
+        
         context_variables = {
             "working_dir": workplace_name, # TODO: change to the codebase path
             "date_limit": metadata["date_limit"],
@@ -245,25 +274,41 @@ Note that the math formula should be as complete as possible.
 """
         messages = [{"role": "user", "content": idea_query}]
         context_variables["notes"] = []
+        self.unified_logger.log_agent_activity(agent_name="IdeaAgent", activity_type="start_call", metadata={"input_query_summary": idea_query[:200]}, message="Starting IdeaAgent execution (initial idea generation).") # Unified Log
         survey_messages, context_variables = await self.idea_agent(messages, context_variables)
+        # Note: survey_res for the *very first* call isn't explicitly logged with an end_call here,
+        # as the subsequent loop and selection process is more significant for the final idea.
+        # The loop itself will have start/end if we decide to log each generation.
+        # For now, focusing on the specified logging points.
+
         survey_res = survey_messages[-1]["content"]
         ideas = [survey_res]
         IDEA_NUM = 5
         for i in range(IDEA_NUM - 1):
+            # Optionally log start/end for each idea generation in the loop if needed for granularity
+            # self.unified_logger.log_agent_activity(agent_name="IdeaAgent", activity_type="start_call", metadata={"iteration": i+1}, message=f"Generating idea {i+2}.")
             messages.extend(survey_messages)
             messages.append({"role": "user", "content": "please survey again and give me another idea"})
             survey_messages, context_variables = await self.idea_agent(messages, context_variables, iter_times=i+1)
             survey_res = survey_messages[-1]["content"]
             ideas.append(survey_res)
-        # messages.extend(survey_messages)
-        messages = [{"role": "user", "content": """\
+            # self.unified_logger.log_agent_activity(agent_name="IdeaAgent", activity_type="end_call", metadata={"iteration": i+1, "output_summary": survey_res[:200]}, message=f"Finished generating idea {i+2}.")
+        
+        # messages.extend(survey_messages) # This line seems redundant as messages are already extended in the loop
+        
+        # Prepare messages for idea selection/refinement call
+        idea_selection_query_content = """\
 You have generated {} innovative ideas for the given task:
 {}
 
 Your task is to analyze multiple existing ideas, select the most novel one, enhance the idea if any key information is missing, finally give me the most novel idea with refined math formula and code implementation. Directly output the selected refined idea report.
-""".format(IDEA_NUM, '\n===================\n==================='.join(ideas))}]
+""".format(IDEA_NUM, '\n===================\n==================='.join(ideas))
+        messages = [{"role": "user", "content": idea_selection_query_content}]
+
+        self.unified_logger.log_agent_activity(agent_name="IdeaAgent", activity_type="start_call", metadata={"input_query_summary": messages[0]['content'][:200] if messages else "N/A"}, message="Starting IdeaAgent execution (idea selection/refinement).") # Unified Log
         survey_messages, context_variables = await self.idea_agent(messages, context_variables, iter_times="select")
         survey_res = survey_messages[-1]["content"]
+        self.unified_logger.log_agent_activity(agent_name="IdeaAgent", activity_type="end_call", metadata={"output_summary": survey_res[:200]}, message="IdeaAgent execution (idea selection/refinement) finished.") # Unified Log
         
         print("\n=== LLM has selected and refined an idea. User review requested. ===")
         
@@ -349,8 +394,10 @@ Your task is to carefully understand the innovative idea, and thoroughly review 
 Note that the code implementation should be as complete as possible.
 """
         messages = [{"role": "user", "content": code_survey_query}]
+        self.unified_logger.log_agent_activity(agent_name="CodeSurveyAgent", activity_type="start_call", metadata={"input_query_summary": code_survey_query[:200]}, message="Starting CodeSurveyAgent execution.") # Unified Log
         code_survey_messages, context_variables = await self.code_survey_agent(messages, context_variables)
         code_survey_res = code_survey_messages[-1]["content"]
+        self.unified_logger.log_agent_activity(agent_name="CodeSurveyAgent", activity_type="end_call", metadata={"output_summary": code_survey_res[:200]}, message="CodeSurveyAgent execution finished.") # Unified Log
         # print(code_survey_res)
         
         context_variables["model_survey"] = code_survey_res
@@ -512,22 +559,97 @@ Remember:
         ml_dev_messages, context_variables = await self.ml_agent(messages, context_variables)
         ml_dev_res = ml_dev_messages[-1]["content"]
 
-        print("\n=== Initial code generated by MLAgent. Human review requested. ===")
-        review_completed_initial = manage_code_review_session(
-            docker_env=self.code_env, 
-            project_path_in_docker=project_path_in_docker,
-            host_review_dir_base=host_code_review_base_dir,
-            session_id_prefix="initial_code_review_idea" # Unique prefix for idea run
-        )
-        if not review_completed_initial:
-            print("Error during initial human code review. Halting execution.")
-            raise SystemExit("Execution halted due to initial code review error or cancellation.")
-        print("--- Initial human code review session concluded. Proceeding to JudgeAgent. ---")
-
-        query = f"""\
+        # ---- Initial JudgeAgent Call ----
+        print("\n=== Initial code by MLAgent. Evaluating with JudgeAgent (Idea Run). ===")
+        initial_judge_query = f"""\
 INPUT:
 You are given an innovative idea:
 {survey_res}
+and the reference codebases chosen by the `Prepare Agent`:
+{prepare_res}
+and the detailed coding plan:
+{plan_res}
+The implementation of the project:
+{ml_dev_res}
+Your task is to evaluate the implementation, and give a suggestion about the implementation. Note that you should carefully check whether the implementation meets the idea, especially the atomic academic concepts in the model survey notes one by one! If not, give comprehensive suggestions about the implementation.
+[IMPORTANT] You should fully utilize the existing resources in the reference codebases as much as possible.
+[IMPORTANT] You should recognize every key point in the innovative idea, and check implementation.
+[IMPORTANT] Some tips: Check plan step-by-step, ensure test process (train 1 dataset, 2 epochs, test), GPU usage.
+"""
+        # Initialize history lists in context_variables if not already present
+        if "quality_score_history" not in context_variables: context_variables["quality_score_history"] = []
+        if "execution_success_history" not in context_variables: context_variables["execution_success_history"] = []
+
+        # ---- Initial Code Quality Checks ----
+        self.logger.info("[run_infer_idea.py] Validating project structure (initial)...")
+        if not self.code_checker.validate_project_structure(project_path_in_docker):
+            self.logger.warning("[run_infer_idea.py] Initial project structure validation (placeholder) indicated issues. Continuing with caution.")
+        else:
+            self.logger.info("[run_infer_idea.py] Initial project structure validation (placeholder) successful.")
+
+        self.logger.info("[run_infer_idea.py] Performing pre-execution checks (initial)...")
+        if not self.code_checker.pre_execution_check(project_path_in_docker, self.code_env):
+            self.logger.warning("[run_infer_idea.py] Initial pre-execution checks (placeholder) indicated issues. Continuing with caution.")
+        else:
+            self.logger.info("[run_infer_idea.py] Initial pre-execution checks (placeholder) successful.")
+        # ---- End Initial Code Quality Checks ----
+        
+        initial_judge_messages_list = [{"role": "user", "content": initial_judge_query}]
+        judged_initial_code_messages, context_variables = await self.judge_agent(initial_judge_messages_list, context_variables)
+        initial_judge_res_str = judged_initial_code_messages[-1]["content"]
+        context_variables["last_judge_res"] = initial_judge_res_str # Store for potential use
+
+        # For intervention check, we need ml_agent_output (ml_dev_res) and judge_agent_feedback (initial_judge_res_str)
+        # Histories are passed as current state (empty for first call to should_request_human_intervention)
+        
+        human_did_initial_review = False
+        if should_request_human_intervention(
+            ml_agent_output=ml_dev_res, # Pass the ML agent's code output
+            judge_agent_feedback=initial_judge_res_str, 
+            current_iteration=0, 
+            max_iterations=max_iter_times, # max_iter_times from args for the main loop
+            execution_success_history=context_variables["execution_success_history"], # Empty for first call
+            quality_score_history=context_variables["quality_score_history"]   # Empty for first call
+        ):
+            print("\n--- Human intervention triggered for initial code (Idea Run). ---")
+            review_completed_initial = manage_code_review_session(
+                docker_env=self.code_env, 
+                project_path_in_docker=project_path_in_docker,
+                host_review_dir_base=host_code_review_base_dir,
+                session_id_prefix="initial_code_review_idea_triggered" 
+            )
+            if not review_completed_initial:
+                print("Error during triggered initial human code review (Idea Run). Halting execution.")
+                raise SystemExit("Execution halted due to triggered code review error or cancellation.")
+            human_did_initial_review = True
+            print("--- Triggered initial human code review session concluded (Idea Run). ---")
+        else:
+            print("--- No human intervention triggered for initial code (Idea Run). Proceeding automatically. ---")
+        
+        # The 'query' for the main loop's first JudgeAgent call (if loop runs) should be based on initial_judge_res_str
+        # However, the loop structure is: ML -> Judge. So initial_judge_res_str is the first feedback *to* ML.
+        judge_res = initial_judge_res_str # This will be the first feedback for the loop's ML agent
+        
+        # `judge_messages` should be the conversation history that led to `initial_judge_res_str`
+        # This will serve as the input history for the first MLAgent call in the loop.
+        loop_ml_agent_input_messages = judged_initial_code_messages
+
+
+        # This 'query' was for the JudgeAgent, but the first JudgeAgent call in the loop
+        # will use a dynamically generated query based on the output of the first MLAgent call in the loop.
+        # The original query variable here is for the first judge_agent call *after* initial MLAgent *and* initial review.
+        # This is now covered by `initial_judge_query` and `initial_judge_res_str`.
+        # The loop will construct its own queries.
+        # initial_code_quality_score and initial_execution_success are already calculated and appended
+        # in the previous step's integration of should_request_human_intervention.
+        # We just need to ensure they are used correctly for the stopping condition.
+        # The `quality_score_history` and `execution_success_history` in `context_variables`
+        # should have one entry each at this point from the initial assessment.
+
+        # query = f"""\  # This query is effectively replaced by initial_judge_query for the first pass
+# INPUT:
+# You are given an innovative idea:
+# {survey_res}
 and the reference codebases chosen by the `Prepare Agent`:
 {prepare_res}
 and the detailed coding plan:
@@ -545,30 +667,54 @@ Your task is to evaluate the implementation, and give a suggestion about the imp
 2. The implementation should have the test process. All in all, you should train ONE dataset with TWO epochs, and finally test the model on the test dataset within one script. The test metrics should follow the plan.
 3. The model should be train on GPU device. If you meet Out of Memory problem, you should try another specific GPU device.
 """
-        input_messages = [{
-            "role": "user",
-            "content": query
-        }]
-        judge_messages, context_variables = await self.judge_agent(input_messages, context_variables)
-        judge_res = judge_messages[-1]["content"]
+        # input_messages = [{ # This was the old way of calling the first judge_agent in loop
+        #     "role": "user",
+        #     "content": query
+        # }]
+        # judge_messages, context_variables = await self.judge_agent(input_messages, context_variables)
+        # judge_res = judge_messages[-1]["content"] # Now judge_res is primed with initial_judge_res_str
 
         MAX_ITER_TIMES = max_iter_times
+        human_edit_note_for_ml_agent = "" # Initialize human edit note
+
+        # Add current quality score and execution success from initial assessment before loop starts
+        # This is needed for the *first* call to should_request_human_intervention *inside* the loop
+        context_variables["quality_score_history"].append(get_estimated_code_quality_score(ml_dev_res, initial_judge_res_str))
+        context_variables["execution_success_history"].append(get_execution_success(initial_judge_res_str))
+
         for i in range(MAX_ITER_TIMES):
-            print(f"\n=== Iteration {i+1}/{MAX_ITER_TIMES}: JudgeAgent feedback received. Human review requested before MLAgent refinement (Idea Run). ===")
-            review_completed_iterative = manage_code_review_session(
-                docker_env=self.code_env,
-                project_path_in_docker=project_path_in_docker,
-                host_review_dir_base=host_code_review_base_dir,
-                session_id_prefix=f"refinement_loop_idea_iter_{i+1}" # Unique prefix for idea run
-            )
-            if not review_completed_iterative:
-                print(f"Error during iterative human code review (iteration {i+1}). Halting execution.")
-                raise SystemExit(f"Execution halted due to iterative code review error or cancellation at iteration {i+1}.")
+            current_loop_iteration = i + 1
+            print(f"\n=== Refinement Iteration {current_loop_iteration}/{MAX_ITER_TIMES} (Idea Run). MLAgent will use feedback: {judge_res[:100]}... ===")
             
-            human_edit_note = "Note: Human has reviewed and potentially modified the code after the last JudgeAgent's feedback. Please consider these human modifications alongside the JudgeAgent's feedback when making your next set of changes. Prioritize human modifications if they conflict with the JudgeAgent's suggestions for the same code sections, but still address other valid points from JudgeAgent if applicable."
-            print(f"--- Iterative human code review session (iteration {i+1}, Idea Run) concluded. ---")
-            
-            query = f"""\
+            # Conditional In-Loop Human Review
+            # `judge_res` here is the feedback from the *previous* JudgeAgent call (or initial one)
+            # `ml_dev_res` is the code associated with that `judge_res`
+            if should_request_human_intervention(
+                ml_agent_output=ml_dev_res, # Code that led to current judge_res
+                judge_agent_feedback=judge_res, 
+                current_iteration=current_loop_iteration, 
+                max_iterations=MAX_ITER_TIMES,
+                execution_success_history=context_variables["execution_success_history"],
+                quality_score_history=context_variables["quality_score_history"]
+            ):
+                print(f"\n--- Human intervention triggered for Iteration {current_loop_iteration} (Idea Run). ---")
+                review_completed_iterative = manage_code_review_session(
+                    docker_env=self.code_env,
+                    project_path_in_docker=project_path_in_docker,
+                    host_review_dir_base=host_code_review_base_dir,
+                    session_id_prefix=f"refinement_loop_idea_iter_{current_loop_iteration}_triggered" 
+                )
+                if not review_completed_iterative:
+                    print(f"Error during triggered human code review (Iteration {current_loop_iteration}, Idea Run). Halting execution.")
+                    raise SystemExit(f"Execution halted due to triggered code review error or cancellation at Iteration {current_loop_iteration}.")
+                human_edit_note_for_ml_agent = "Note: Human has reviewed and potentially modified the code. Please consider these human modifications alongside the JudgeAgent's feedback when making your next set of changes. Prioritize human modifications if they conflict with the JudgeAgent's suggestions for the same code sections, but still address other valid points from JudgeAgent if applicable."
+                print(f"--- Triggered human code review session (Iteration {current_loop_iteration}, Idea Run) concluded. ---")
+            else:
+                print(f"--- No human intervention triggered for Iteration {current_loop_iteration} (Idea Run). Proceeding with MLAgent refinement. ---")
+                human_edit_note_for_ml_agent = "" # Clear if no review this iteration
+
+            # MLAgent refinement call
+            refinement_ml_query = f"""\
 You are given an innovative idea:
 {survey_res}
 and the reference codebases chosen by the `Prepare Agent`:
@@ -598,11 +744,34 @@ Remember:
 - MUST use actual dataset (no toy data)
 - MUST complete 2 epochs of training and testing
 """
-            query = human_edit_note + "\n\n" + query # Prepend the human edit note
-            judge_messages.append({"role": "user", "content": query})
-            judge_messages, context_variables = await self.ml_agent(judge_messages, context_variables, iter_times=i+1)
-            ml_dev_res = judge_messages[-1]["content"]
-            query = f"""\
+            if human_edit_note_for_ml_agent: # Prepend note if it exists
+                refinement_ml_query_final = human_edit_note_for_ml_agent + "\n\n" + refinement_ml_query
+            else:
+                refinement_ml_query_final = refinement_ml_query
+            
+            # `loop_ml_agent_input_messages` holds the conversation that led to the current `judge_res`
+            current_ml_history = [msg for msg in loop_ml_agent_input_messages]
+            current_ml_history.append({"role": "user", "content": refinement_ml_query_final})
+            
+            ml_dev_messages, context_variables = await self.ml_agent(current_ml_history, context_variables, iter_times=current_loop_iteration)
+            ml_dev_res = ml_dev_messages[-1]["content"] # New code from MLAgent
+
+            # ---- In-Loop Code Quality Checks ----
+            self.logger.info(f"[run_infer_idea.py] Iteration {current_loop_iteration}: Validating project structure...")
+            if not self.code_checker.validate_project_structure(project_path_in_docker):
+                self.logger.warning(f"[run_infer_idea.py] Iteration {current_loop_iteration}: Project structure validation (placeholder) indicated issues. Continuing with caution.")
+            else:
+                self.logger.info(f"[run_infer_idea.py] Iteration {current_loop_iteration}: Project structure validation (placeholder) successful.")
+
+            self.logger.info(f"[run_infer_idea.py] Iteration {current_loop_iteration}: Performing pre-execution checks...")
+            if not self.code_checker.pre_execution_check(project_path_in_docker, self.code_env):
+                self.logger.warning(f"[run_infer_idea.py] Iteration {current_loop_iteration}: Pre-execution checks (placeholder) indicated issues. Continuing with caution.")
+            else:
+                self.logger.info(f"[run_infer_idea.py] Iteration {current_loop_iteration}: Pre-execution checks (placeholder) successful.")
+            # ---- End In-Loop Code Quality Checks ----
+
+            # JudgeAgent call to evaluate the refined code
+            judge_refined_query = f"""\
 You are given an innovative idea:
 {survey_res}
 and the reference codebases chosen by the `Prepare Agent`:
@@ -613,13 +782,46 @@ The implementation of the project:
 {ml_dev_res}
 Please evaluate the implementation, and give a suggestion about the implementation.
 """
-            judge_messages.append({"role": "user", "content": query})
-            judge_messages, context_variables = await self.judge_agent(judge_messages, context_variables, iter_times=i+1)
-            judge_res = judge_messages[-1]["content"]
-            if '"fully_correct": true' in judge_messages[-1]["content"]:
-                break   
+            # For JudgeAgent, we typically start a fresh evaluation of the new code
+            judged_refined_code_messages_list = [{"role": "user", "content": judge_refined_query}]
+            judged_refined_code_messages, context_variables = await self.judge_agent(judged_refined_code_messages_list, context_variables, iter_times=current_loop_iteration)
+            judge_res = judged_refined_code_messages[-1]["content"] # This is the new feedback
 
-        # return judge_messages[-1]["content"]
+            # Update histories for next iteration's intervention check AND intelligent stopping condition
+            current_judge_feedback_str = judge_res # current_judge_feedback_str is judge_res
+            current_ml_agent_output_for_quality = ml_dev_res # ml_dev_res is the code that was judged
+
+            current_exec_success = get_execution_success(current_judge_feedback_str)
+            # Pass ml_dev_res (code) and judge_res (feedback on that code)
+            current_quality_score = get_estimated_code_quality_score(current_ml_agent_output_for_quality, current_judge_feedback_str)
+            
+            context_variables["quality_score_history"].append(current_quality_score)
+            context_variables["execution_success_history"].append(current_exec_success)
+            self.logger.info(f"[run_infer_idea.py] Iteration {current_loop_iteration}: Quality={current_quality_score}, ExecSuccess={current_exec_success}")
+            print(f"--- [run_infer_idea.py] Iteration {current_loop_iteration}: Quality={current_quality_score}, ExecSuccess={current_exec_success} ---")
+            
+            # Update `loop_ml_agent_input_messages` for the next MLAgent call
+            loop_ml_agent_input_messages = judged_refined_code_messages
+
+            # Integrate intelligent_stopping_condition
+            if intelligent_stopping_condition(
+                judge_result_str=current_judge_feedback_str,
+                current_loop_iter_idx=i, # loop variable i (0-indexed)
+                max_loop_iters=MAX_ITER_TIMES,
+                quality_score_history=context_variables.get("quality_score_history", []),
+                logger=self.logger
+            ):
+                self.logger.info(f"[run_infer_idea.py] Intelligent stopping condition met at iteration {current_loop_iteration}. Breaking refinement loop.")
+                print(f"--- [run_infer_idea.py] Intelligent stopping condition met at iteration {current_loop_iteration}. Breaking refinement loop. ---")
+                break
+            
+            # Redundant '"fully_correct": true' check is removed as it's part of intelligent_stopping_condition.
+            
+            if current_loop_iteration >= MAX_ITER_TIMES:
+                 print(f"--- Reached max refinement iterations ({MAX_ITER_TIMES}) for Idea Run. Loop will terminate. ---")
+
+
+        # return judged_refined_code_messages[-1]["content"] # Or the last judge_res
         # submit the code to the environment -> get the result
 
 
