@@ -507,13 +507,19 @@ Your task is to evaluate the implementation, and give a suggestion about the imp
         context_variables["execution_success_history"].append(initial_execution_success)
 
         print(f"\n--- JudgeAgent initial evaluation complete. Initial Quality: {initial_code_quality_score}, Initial Exec Success: {initial_execution_success}. Intervention check (Iteration 0). ---")
+        # if should_request_human_intervention(
+        #     ml_agent_output=ml_dev_res,
+        #     judge_agent_feedback=judge_res_initial,
+        #     current_iteration=0, # Iteration 0 for initial review
+        #     max_iterations=max_iter_times, # Total iterations for the main loop
+        #     execution_success_history=context_variables["execution_success_history"],
+        #     quality_score_history=context_variables["quality_score_history"]
+        # ):
         if should_request_human_intervention(
-            ml_agent_output=ml_dev_res,
-            judge_agent_feedback=judge_res_initial,
-            current_iteration=0, # Iteration 0 for initial review
-            max_iterations=max_iter_times, # Total iterations for the main loop
-            execution_success_history=context_variables["execution_success_history"],
-            quality_score_history=context_variables["quality_score_history"]
+                judge_result_str=judge_res_initial,
+                current_iteration=0,
+                max_iterations=max_iter_times,
+                logger=self.logger
         ):
             print("\n=== Human intervention triggered for initial code. ===")
             review_completed_initial = manage_code_review_session(
@@ -603,13 +609,19 @@ Your task is to evaluate the implementation, and give a suggestion about the imp
             print(f"\n=== Refinement Iteration {current_loop_iteration}/{MAX_ITER_TIMES} ===")
             
             # Potentially request human intervention
+            # if should_request_human_intervention(
+            #     ml_agent_output=ml_dev_res, # Current code from MLAgent (previous iteration or initial)
+            #     judge_agent_feedback=judge_res, # Current feedback from JudgeAgent
+            #     current_iteration=current_loop_iteration,
+            #     max_iterations=MAX_ITER_TIMES,
+            #     execution_success_history=context_variables["execution_success_history"],
+            #     quality_score_history=context_variables["quality_score_history"]
+            # ):
             if should_request_human_intervention(
-                ml_agent_output=ml_dev_res, # Current code from MLAgent (previous iteration or initial)
-                judge_agent_feedback=judge_res, # Current feedback from JudgeAgent
-                current_iteration=current_loop_iteration,
-                max_iterations=MAX_ITER_TIMES,
-                execution_success_history=context_variables["execution_success_history"],
-                quality_score_history=context_variables["quality_score_history"]
+                judge_result_str=judge_res,
+                current_iteration=current_loop_iteration, # This is (i+1)
+                max_iterations=max_iter_times,
+                logger=self.logger
             ):
                 print(f"\n--- Human intervention triggered for Iteration {current_loop_iteration}. ---")
                 review_completed_iterative = manage_code_review_session(
