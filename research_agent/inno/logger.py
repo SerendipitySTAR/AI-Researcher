@@ -113,6 +113,29 @@ class MetaChainLogger:
         timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         if self.log_path: self._save_tool_call(tool_calls, timestamp)
         if self.debug: self._print_tool_call(tool_calls, timestamp)
+
+    def log_agent_activity(self, agent_name: str, action: str, details: dict = None):
+        """
+        Logs a specific activity or milestone for an agent.
+        """
+        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        title = f"Agent Activity: {agent_name}"
+        
+        message_lines = [f"Action: {action}"]
+        if details:
+            for key, value in details.items():
+                message_lines.append(f"  {key.replace('_', ' ').capitalize()}: {value}")
+        
+        full_message = "\n".join(message_lines)
+        log_str = f"[{timestamp}]\n{full_message}"
+
+        if self.debug:
+            self.console.print(self._wrap_title(title, "bold cyan"))
+            self.console.print(escape(log_str), highlight=True, emoji=True)
+        
+        if self.log_path:
+            self._write_log(self._wrap_title(title)) # Write title without color codes
+            self._write_log(log_str)
 class LoggerManager:
     _instance = None
     _logger: MetaChainLogger = None

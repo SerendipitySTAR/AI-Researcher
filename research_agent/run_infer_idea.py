@@ -1,4 +1,7 @@
 import json
+from research_agent.validation import validate_source_papers, ValidationError
+from research_agent.intervention_utils import should_request_human_intervention, intelligent_stopping_condition
+from research_agent.code_quality_checker import CodeQualityChecker
 from research_agent.inno.workflow.flowcache import FlowModule, ToolModule, AgentModule
 from research_agent.inno.tools.inno_tools.paper_search import get_arxiv_paper_meta
 from research_agent.inno.tools.inno_tools.code_search import search_github_repos, search_github_code
@@ -113,6 +116,23 @@ class InnoFlow(FlowModule):
         self.exp_analyser = AgentModule(get_exp_analyser_agent(model=CHEEP_MODEL, file_env=file_env, code_env=code_env), self.client, cache_path)
     async def forward(self, instance_path: str, task_level: str, local_root: str, workplace_name: str, max_iter_times: int, category: str, *args, **kwargs):
         metadata = self.load_ins({"instance_path": instance_path, "task_level": task_level})
+        try:
+            validate_source_papers(metadata["source_papers"])
+            # Optionally, log successful validation if a logger is available here
+            # self.logger.info("source_papers validation successful.")
+        except ValidationError as e:
+            # Log the error and decide how to handle it. 
+            # For now, let's print and re-raise or exit, depending on desired behavior.
+            print(f"Validation Error for source_papers: {e}") # Or use a logger
+            # Depending on requirements, you might want to raise e, or sys.exit(), 
+            # or return an error state from the forward method.
+            # For now, re-raising to halt execution on validation failure.
+            raise e
+        
+        # Instantiate CodeQualityChecker now that workplace_name is available
+        # The path f"/{workplace_name}/project" is based on agent's perspective of the file system.
+        self.code_quality_checker = CodeQualityChecker(project_base_path=f"/{workplace_name}/project")
+
         context_variables = {
             "working_dir": workplace_name, # TODO: change to the codebase path
             "date_limit": metadata["date_limit"],
@@ -191,6 +211,11 @@ Your task is to analyze multiple existing ideas, select the most novel one, enha
 """.format(IDEA_NUM, '\n===================\n==================='.join(ideas))}]
         survey_messages, context_variables = await self.idea_agent(messages, context_variables, iter_times="select")
         survey_res = survey_messages[-1]["content"]
+        self.logger.log_agent_activity(
+            agent_name="IdeaAgent", 
+            action="Selected and refined innovative idea", 
+            details={"idea_summary": survey_res[:200] + "..."} # Log a snippet
+        )
         # print(survey_res)
 
         code_survey_query = f"""\
@@ -208,6 +233,11 @@ Note that the code implementation should be as complete as possible.
         messages = [{"role": "user", "content": code_survey_query}]
         code_survey_messages, context_variables = await self.code_survey_agent(messages, context_variables)
         code_survey_res = code_survey_messages[-1]["content"]
+        self.logger.log_agent_activity(
+            agent_name="CodeSurveyAgent",
+            action="Generated code implementation report",
+            details={"report_summary": code_survey_res[:200] + "..."} # Log a snippet
+        )
         # print(code_survey_res)
         
         context_variables["model_survey"] = code_survey_res
@@ -232,6 +262,11 @@ Your task is to carefully review the existing resources and understand the task,
         messages = [{"role": "user", "content": plan_query}]
         plan_messages, context_variables = await self.coding_plan_agent(messages, context_variables)
         plan_res = plan_messages[-1]["content"]
+        self.logger.log_agent_activity(
+            agent_name="CodingPlanAgent",
+            action="Generated coding plan",
+            details={"plan_summary": plan_res[:200] + "..."} # Log a snippet
+        )
 
         # write the model based on the model survey notes
         ml_dev_query = f"""\
@@ -351,8 +386,20 @@ Remember:
 - MUST complete 2 epochs of training and testing
 """
         messages = [{"role": "user", "content": ml_dev_query}]
+        
+        # Perform initial project structure validation before the first ML agent call
+        self.logger.info("Performing initial project structure validation.", title="CodeQuality")
+        if not self.code_quality_checker.validate_project_structure():
+            self.logger.warning("Initial project structure validation failed. Continuing with generation, but issues may arise.", title="CodeQuality")
+            # Depending on strictness, could raise an error or halt here.
+        
         ml_dev_messages, context_variables = await self.ml_agent(messages, context_variables)
         ml_dev_res = ml_dev_messages[-1]["content"]
+        self.logger.log_agent_activity(
+            agent_name="MLAgent",
+            action="Completed initial code implementation pass",
+            details={"output_summary": ml_dev_res[:200] + "..."}
+        )
 
         query = f"""\
 INPUT:
@@ -381,9 +428,62 @@ Your task is to evaluate the implementation, and give a suggestion about the imp
         }]
         judge_messages, context_variables = await self.judge_agent(input_messages, context_variables)
         judge_res = judge_messages[-1]["content"]
+        self.logger.log_agent_activity(
+            agent_name="JudgeAgent",
+            action="Provided evaluation for initial implementation",
+            details={"evaluation_summary": judge_res[:200] + "..."}
+        )
+
+        # Initialize histories and current metrics for intervention and stopping logic
+        quality_score_history = []
+        execution_success_history = []
+        current_quality_score = 0.0  # Default
+        current_execution_success = False  # Default
+
+        # Placeholder: Extract initial quality and success from the first judge_res
+        if '"fully_correct": true' in judge_res:
+            current_execution_success = True
+            current_quality_score = 0.8  # Arbitrary high score for initial success
+        else:
+            current_execution_success = False
+            current_quality_score = 0.4  # Arbitrary low score for initial failure/issues
+        
+        quality_score_history.append(current_quality_score)
+        execution_success_history.append(current_execution_success)
+
+        if should_request_human_intervention(
+            code_generation_attempt=1,  # First attempt
+            code_quality_score=current_quality_score,
+            execution_success_history=execution_success_history, # Will contain one entry
+            is_initial_code=True
+        ):
+            self.logger.info("Human intervention recommended for the initial generated code based on quality/success.", title="Intervention Check")
+            # In a real system, this might trigger a notification or pause.
+            # For now, logging and continuing.
 
         MAX_ITER_TIMES = max_iter_times
         for i in range(MAX_ITER_TIMES):
+            # Before ML agent call, check for stopping condition from previous iteration's judgment
+            # This check is at the beginning of the loop, using data from the *previous* iteration's judge_agent call
+            # or the initial assessment before the loop.
+            if i > 0: # Skip for the first iteration as assessment is done before loop or at the end of previous iteration
+                if intelligent_stopping_condition(
+                    quality_score_history=quality_score_history,
+                    execution_success_history=execution_success_history,
+                    iteration_count=i, # Current iteration number (i has been incremented by loop)
+                    max_iterations=MAX_ITER_TIMES
+                ):
+                    self.logger.info(f"Intelligent stopping condition met at the beginning of iteration {i+1}.", title="Stopping Condition")
+                    break # Exit the refinement loop
+            
+            # Perform pre-execution check before ML agent call in the refinement loop
+            self.logger.info(f"Performing pre-execution check for iteration {i+1}.", title="CodeQuality")
+            # Assuming the main script to check is always run_training_testing.py in the project root
+            main_script_path = f"/{workplace_name}/project/run_training_testing.py"
+            if not self.code_quality_checker.pre_execution_check(script_path=main_script_path):
+                self.logger.warning(f"Pre-execution check failed for {main_script_path} in iteration {i+1}. Continuing, but execution might fail.", title="CodeQuality")
+                # Depending on strictness, could decide to not proceed with this iteration or halt.
+
             query = f"""\
 You are given an innovative idea:
 {survey_res}
@@ -417,6 +517,11 @@ Remember:
             judge_messages.append({"role": "user", "content": query})
             judge_messages, context_variables = await self.ml_agent(judge_messages, context_variables, iter_times=i+1)
             ml_dev_res = judge_messages[-1]["content"]
+            self.logger.log_agent_activity(
+                agent_name="MLAgent",
+                action=f"Completed code modification pass (refinement iteration {i+1})",
+                details={"output_summary": ml_dev_res[:200] + "..."}
+            )
             query = f"""\
 You are given an innovative idea:
 {survey_res}
@@ -431,7 +536,51 @@ Please evaluate the implementation, and give a suggestion about the implementati
             judge_messages.append({"role": "user", "content": query})
             judge_messages, context_variables = await self.judge_agent(judge_messages, context_variables, iter_times=i+1)
             judge_res = judge_messages[-1]["content"]
+            self.logger.log_agent_activity(
+                agent_name="JudgeAgent",
+                action=f"Provided evaluation (refinement iteration {i+1})",
+                details={"evaluation_summary": judge_res[:200] + "..."}
+            )
+
+            # Placeholder: Extract quality and success from judge_res from this iteration
+            if '"fully_correct": true' in judge_res:
+                current_execution_success = True
+                # Assume quality improves slightly or is parsed from judge_res
+                current_quality_score = quality_score_history[-1] + 0.1 if quality_score_history else 0.5 
+                current_quality_score = min(current_quality_score, 1.0) # Cap at 1.0
+            else:
+                current_execution_success = False
+                # Assume quality might not improve or is parsed
+                current_quality_score = quality_score_history[-1] - 0.1 if quality_score_history else 0.3
+                current_quality_score = max(current_quality_score, 0.0) # Floor at 0.0
+
+            quality_score_history.append(current_quality_score)
+            execution_success_history.append(current_execution_success)
+            
+            # Check for intervention within the loop (e.g., due to repeated failures)
+            if not current_execution_success and should_request_human_intervention(
+                code_generation_attempt=i + 2, # i starts from 0, so +1 for attempt number, +1 as it's after initial
+                code_quality_score=current_quality_score,
+                execution_success_history=execution_success_history,
+                is_initial_code=False
+            ):
+                self.logger.info(f"Human intervention recommended during refinement iteration {i+1} due to persistent issues.", title="Intervention Check")
+                # Optionally, could break or implement a specific intervention mechanism here.
+
+            # Check for intelligent stopping condition AT THE END of the iteration's logic
+            # This uses the most recent quality/success data.
+            if intelligent_stopping_condition(
+                quality_score_history=quality_score_history,
+                execution_success_history=execution_success_history,
+                iteration_count=i + 1, # i starts from 0, so this is the current completed iteration count
+                max_iterations=MAX_ITER_TIMES
+            ):
+                self.logger.info(f"Intelligent stopping condition met at the end of iteration {i+1}.", title="Stopping Condition")
+                break # Exit the refinement loop
+
+            # Existing break condition (can be kept for safety or if it implies specific success not covered by intelligent_stopping)
             if '"fully_correct": true' in judge_messages[-1]["content"]:
+                self.logger.info(f"Stopping due to 'fully_correct' condition at iteration {i+1}.", title="Stopping Condition")
                 break   
 
         # return judge_messages[-1]["content"]
@@ -457,6 +606,11 @@ After you get the result, you should return the result with your analysis and su
         judge_messages.append({"role": "user", "content": ml_submit_query})
         judge_messages, context_variables = await self.ml_agent(judge_messages, context_variables, iter_times="submit")
         submit_res = judge_messages[-1]["content"]
+        self.logger.log_agent_activity(
+            agent_name="MLAgent",
+            action="Completed code submission pass (submit)",
+            details={"output_summary": submit_res[:200] + "..."} 
+        )
 
         EXP_ITER_TIMES = 2
         for i in range(EXP_ITER_TIMES):
@@ -480,7 +634,15 @@ DO NOT use the `case_resolved` function before you have carefully and comprehens
 """
             judge_messages.append({"role": "user", "content": exp_planner_query})
             judge_messages, context_variables = await self.exp_analyser(judge_messages, context_variables, iter_times=f"refine_{i+1}")
-            analysis_report = judge_messages[-1]["content"]
+            analysis_report = judge_messages[-1]["content"] # This is the raw response
+            self.logger.log_agent_activity(
+                agent_name="ExpAnalyserAgent",
+                action=f"Provided experiment analysis and further plan (experiment iteration {i+1})", # i is from EXP_ITER_TIMES loop
+                details={
+                    "analysis_summary": context_variables.get("experiment_report", [{}])[-1].get("analysis_report", "")[:100] + "...",
+                    "further_plan_summary": context_variables.get("experiment_report", [{}])[-1].get("further_plan", "")[:100] + "..."
+                }
+            )
 
             analysis_report = context_variables["experiment_report"][-1]["analysis_report"]
             further_plan = context_variables["experiment_report"][-1]["further_plan"]
@@ -503,6 +665,11 @@ Note that you should fully utilize the existing code in the directory `/{workpla
             judge_messages.append({"role": "user", "content": refine_query})
             judge_messages, context_variables = await self.ml_agent(judge_messages, context_variables, iter_times=f"refine_{i+1}")
             refine_res = judge_messages[-1]["content"]
+            self.logger.log_agent_activity(
+                agent_name="MLAgent",
+                action=f"Completed code refinement pass (experiment iteration {i+1})", # i is from EXP_ITER_TIMES loop
+                details={"output_summary": refine_res[:200] + "..."}
+            )
 
         print(refine_res)
         

@@ -922,6 +922,15 @@ export GPUS='"device=0,1"'
 python run_infer_idea.py --instance_path ../benchmark/final/${category}/${instance_id}.json --container_name paper_eval --model $COMPLETION_MODEL --workplace_name workplace --cache_path cache --port 12372 --max_iter_times 0 --category ${category}
 ```
 
+The `run_infer_idea.py` script (Level 2 tasks) now incorporates several advanced features to enhance its autonomy, efficiency, and robustness, mirroring capabilities found in `run_infer_plan.py`. These include:
+*   **Input Validation**: Performs pre-checks on source paper data to ensure integrity.
+*   **Smart Human Intervention (Logging)**: Code review needs are now conditionally logged. The system logs when human intervention might be beneficial for the initial code or during refinement based on performance, allowing for optional human oversight without halting automated processes.
+*   **Dynamic Stopping Conditions**: The code optimization process can conclude dynamically based on a comprehensive assessment of quality score history, execution success, and iteration progress, rather than relying solely on a fixed number of iterations.
+*   **Code Quality Assurance (Placeholders)**: Foundational checks for project structure and pre-execution conditions are integrated (currently as placeholders) before critical code generation and execution steps.
+*   **Unified Agent Activity Logging**: Key actions performed by different agents (e.g., IdeaAgent, CodeSurveyAgent, MLAgent) are logged for better traceability and understanding of the autonomous research process.
+
+These improvements contribute to a more resilient and intelligent automated research workflow when generating ideas from reference papers.
+
 ### 2. Paper Writing Agent
 
 If you want to generate the paper after the research agent has conducted the research, you can use the following command in the [`paper_agent/run_paper.sh`](./paper_agent/run_paper.sh):
