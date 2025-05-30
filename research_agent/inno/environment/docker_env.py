@@ -136,6 +136,53 @@ class DockerEnv:
         result = subprocess.run(stop_command, capture_output=True, text=True)
         if result.returncode != 0:
             raise Exception(f"Failed to stop container: {result.stderr}")
+
+    def get_gpu_memory_info(self) -> list[dict[str, int]]:
+        """
+        Retrieves GPU memory information (total and free) from the Docker container
+        using nvidia-smi.
+
+        Returns:
+            A list of dictionaries, where each dictionary represents a GPU
+            and contains 'id', 'total_memory_mib', and 'free_memory_mib'.
+            Returns an empty list if nvidia-smi fails or no GPUs are found.
+        """
+        command = "nvidia-smi --query-gpu=memory.total,memory.free --format=csv,noheader,nounits"
+        try:
+            response = self.run_command(command) # Assuming run_command returns a dict like {'status': 0, 'result': 'stdout_output'}
+            
+            if response.get('status') != 0 or not response.get('result'):
+                print(f"nvidia-smi command failed or returned empty. Status: {response.get('status')}, Result: {response.get('result')}")
+                return []
+
+            output = response['result'].strip()
+            gpu_info_list = []
+            if not output: # Handles cases where nvidia-smi runs but there's no output (e.g. no GPUs)
+                return []
+
+            lines = output.split('\n') # Docker run_command might escape newlines
+            if len(lines) == 1 and lines[0] == '' and '\\n' in output: # Handle case of empty string after strip if contains escaped newlines
+                 lines = output.split('\\n')
+
+
+            for i, line in enumerate(lines):
+                if not line.strip():
+                    continue
+                try:
+                    total, free = line.split(',')
+                    gpu_info_list.append({
+                        "id": i,
+                        "total_memory_mib": int(total.strip()),
+                        "free_memory_mib": int(free.strip())
+                    })
+                except ValueError as e:
+                    print(f"Error parsing GPU memory info line: '{line}'. Error: {e}")
+                    continue
+            return gpu_info_list
+        except Exception as e:
+            # This broad exception is to catch errors from self.run_command or other unexpected issues.
+            print(f"Error executing nvidia-smi or parsing its output: {e}")
+            return []
     
     def run_command(self, command, stream_callback=None):
         """
