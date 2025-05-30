@@ -12,9 +12,9 @@ class AgentModule:
         self.agent = agent
         self.client = client
         self.cache_path = cache_path
-    async def __call__(self, messages: List[Dict], context_variables: Dict, iter_times: int = None, *args, **kwargs):
+    async def __call__(self, messages: List[Dict], context_variables: Dict, iter_times: int = None, interactive_cache_check: bool = True, *args, **kwargs):
         # messages = [{"role": "user", "content": query}]
-        agent_cache, escape_running = self.check_cache(self.agent.name, iter_times)
+        agent_cache, escape_running = self.check_cache(self.agent.name, iter_times, interactive=interactive_cache_check)
         if agent_cache and escape_running:
             messages.extend(agent_cache["messages"])
             context_variables.update(agent_cache["context_variables"])
@@ -51,22 +51,60 @@ class AgentModule:
         os.makedirs(os.path.dirname(agent_cache_file), exist_ok=True)
         with open(agent_cache_file, "w", encoding="utf-8") as f:
             json.dump({"messages": messages, "context_variables": context_variables}, f, ensure_ascii=False, indent=4)
-    def check_cache(self, agent_name, iter_times: int = None):
+
+    def check_cache(self, agent_name, iter_times: int = None, interactive: bool = True):
         agent_name_norm = agent_name.replace(" ", "_").lower()
         if iter_times is not None:
             agent_name_norm = agent_name_norm + f"_iter_{iter_times}"
         cache_file = f"{self.cache_path}/agents/{agent_name_norm}.json"
+
         if os.path.exists(cache_file):
-            choice = single_select_menu(["Yes", "Resume", "No"], f"The agent '{agent_name}' cache file exists, do you want to use it?")
-            if choice == "Yes":
-                with open(cache_file, "r", encoding="utf-8") as f:
-                    return json.load(f), True
-            elif choice == "Resume":
-                with open(cache_file, "r", encoding="utf-8") as f:
-                    return json.load(f), False
-            else:
-                return None, False
+            if not interactive: # Non-interactive mode: automatically load if cache exists
+                try:
+                    with open(cache_file, "r", encoding="utf-8") as f:
+                        return json.load(f), True # True indicates full load, skip running
+                except Exception as e:
+                    print(f"Error loading cache file {cache_file} non-interactively: {e}")
+                    return None, False
+            else: # Interactive mode
+                choice = single_select_menu(["Yes", "Resume", "No"], f"The agent '{agent_name}' cache file exists, do you want to use it?")
+                if choice == "Yes":
+                    with open(cache_file, "r", encoding="utf-8") as f:
+                        return json.load(f), True # True indicates full load, skip running
+                elif choice == "Resume":
+                    with open(cache_file, "r", encoding="utf-8") as f:
+                        return json.load(f), False # False indicates resume, re-run needed
+                else: # "No"
+                    return None, False
         return None, False
+
+    def list_checkpoints(self, agent_name_prefix: str) -> list[str]:
+        """Lists available checkpoint files for a given agent name prefix, sorted newest first."""
+        agent_dir = os.path.join(self.cache_path, "agents")
+        if not os.path.isdir(agent_dir):
+            return []
+        
+        checkpoints = []
+        prefix_norm = agent_name_prefix.replace(" ", "_").lower()
+        for filename in os.listdir(agent_dir):
+            if filename.startswith(prefix_norm) and filename.endswith(".json"):
+                checkpoints.append(os.path.join(agent_dir, filename))
+        
+        # Sort by modification time, newest first
+        checkpoints.sort(key=os.path.getmtime, reverse=True)
+        return checkpoints
+
+    def load_checkpoint(self, checkpoint_path: str) -> dict | None:
+        """Loads a specific checkpoint file."""
+        if not os.path.exists(checkpoint_path):
+            print(f"Checkpoint file not found: {checkpoint_path}")
+            return None
+        try:
+            with open(checkpoint_path, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except Exception as e:
+            print(f"Error loading checkpoint file {checkpoint_path}: {e}")
+            return None
     
 class ToolModule:
     def __init__(self, tool: Callable[[Any], Union[str, Dict]], cache_path: str):
