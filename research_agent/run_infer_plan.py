@@ -8,6 +8,7 @@ from research_agent.inno.agents.inno_agent.ml_agent import get_ml_agent
 from research_agent.inno.agents.inno_agent.judge_agent import get_judge_agent
 from research_agent.inno.agents.inno_agent.survey_agent import get_survey_agent
 from research_agent.inno.agents.inno_agent.exp_analyser import get_exp_analyser_agent
+from research_agent.inno.agents.inno_agent.quality_control_agents import get_plan_validator_agent, get_quality_assurance_agent
 from research_agent.inno.tools.arxiv_source import download_arxiv_source_by_title
 from research_agent.inno import MetaChain
 from tqdm import tqdm
@@ -17,6 +18,8 @@ from research_agent.inno.util import single_select_menu
 from research_agent.inno.environment.docker_env import DockerEnv, DockerConfig
 from research_agent.inno.environment.browser_env import BrowserEnv
 from research_agent.inno.environment.markdown_browser import RequestsMarkdownBrowser
+from research_agent.inno.config import SmartExecutionConfig
+from research_agent.inno.quality_tracker import QualityTracker
 import asyncio
 import argparse
 import os
@@ -110,7 +113,26 @@ class InnoFlow(FlowModule):
         self.judge_agent = AgentModule(get_judge_agent(model=CHEEP_MODEL, code_env=code_env, web_env=web_env, file_env=file_env), self.client, cache_path)
         self.survey_agent = AgentModule(get_survey_agent(model=CHEEP_MODEL, file_env=file_env, code_env=code_env), self.client, cache_path)
         self.exp_analyser = AgentModule(get_exp_analyser_agent(model=CHEEP_MODEL, file_env=file_env, code_env=code_env), self.client, cache_path)
+        
+        self.plan_validator_agent = AgentModule(
+            get_plan_validator_agent(model=CHEEP_MODEL, code_env=code_env), 
+            self.client, 
+            cache_path
+        )
+        self.quality_assurance_agent = AgentModule(
+            get_quality_assurance_agent(model=CHEEP_MODEL, code_env=code_env), 
+            self.client, 
+            cache_path
+        )
+
+        self.smart_config = SmartExecutionConfig()
+        self.code_env = code_env # Storing code_env for later use
+        self.quality_tracker = QualityTracker()
+        self.rollback_attempts_left = self.smart_config.max_rollback_attempts
+        self.logger = self.client.logger # For easy access to logger
     async def forward(self, instance_path: str, task_level: str, local_root: str, workplace_name: str, max_iter_times: int, category: str, *args, **kwargs):
+        self.logger.info("--- Starting AI Researcher Workflow ---")
+        self.logger.info("--- Starting Preparation Phase ---")
         metadata = self.load_ins({"instance_path": instance_path, "task_level": task_level})
         context_variables = {
             "working_dir": workplace_name, # TODO: change to the codebase path
@@ -139,6 +161,9 @@ Your task is to choose at least 5 repositories as the reference codebases.
         prepare_dict = extract_json_from_output(prepare_res)
         paper_list = prepare_dict["reference_papers"]
         download_res = self.download_papaer({"paper_list": paper_list, "local_root": local_root, "workplace_name": workplace_name})
+        self.logger.info("Reference materials and codebases prepared.")
+        self.logger.info("--- Preparation Phase Completed ---")
+        self.logger.info("--- Starting Survey & Planning Phase ---")
         survey_query = f"""\
 I have an innovative ideas related to machine learning:
 {metadata["task_instructions"]}
@@ -198,9 +223,37 @@ Your task is to carefully review the existing resources and understand the task,
         plan_messages, context_variables = await self.coding_plan_agent(messages, context_variables)
         plan_res = plan_messages[-1]["content"]
 
-        # write the model based on the model survey notes
-        ml_dev_query = f"""\
-INPUT:
+        self.logger.info("Plan generated. Validating plan...")
+        context_variables["plan_content"] = plan_res # Pass the plan to the validator
+        
+        plan_validator_messages_history = [{"role": "user", "content": "Validate the plan provided in context_variables."}]
+        validated_plan_messages, context_variables = await self.plan_validator_agent(
+            plan_validator_messages_history,
+            context_variables
+        )
+        plan_validation_res = validated_plan_messages[-1]["content"]
+        self.logger.info(f"Plan Validation Result: {plan_validation_res}") # Existing log
+        # Add logic here to handle plan_validation_res (e.g. raise if invalid)
+        # ...
+        self.logger.info("--- Survey & Planning Phase Completed ---")
+        self.logger.info("--- Starting Initial Implementation & Verification Phase ---")
+
+        # Get GPU memory information (once before the main loop)
+        gpu_memory_info = []
+        if self.code_env: # Ensure code_env is available
+            gpu_memory_info = self.code_env.get_gpu_memory_info()
+            self.logger.info(f"Retrieved GPU Info: {gpu_memory_info}")
+
+        # Update context_variables for all ml_agent calls within the loop
+        context_variables["gpu_memory_info"] = gpu_memory_info
+        context_variables["gpu_memory_threshold"] = self.smart_config.gpu_memory_threshold
+        context_variables["auto_batch_size_adjustment"] = self.smart_config.auto_batch_size_adjustment
+        
+        # Main ML Development and Judging Loop
+        current_ml_dev_res = "" # Stores the output of the last successful ml_agent call in the loop
+        current_judge_res = ""  # Stores the output of the last successful judge_agent call in the loop
+        
+        ml_agent_initial_query = f"""INPUT:
 You are given an innovative idea:
 {metadata["task_instructions"]}. 
 and the reference codebases chosen by the `Prepare Agent`:
@@ -222,92 +275,76 @@ PROJECT STRUCTURE REQUIREMENTS:
     * All model architecture files
     * All model components as specified in survey notes
     * Dataset processing scripts and utilities
-
 - Training: `/{workplace_name}/project/training/`
     * Training loop implementation
     * Loss functions
     * Optimization logic
-
 - Testing: `/{workplace_name}/project/testing/`
     * Evaluation metrics
     * Testing procedures
-
 - Data processing: `/{workplace_name}/project/data_processing/`
     * Implement the data processing pipeline
-
 - Main Script: `/{workplace_name}/project/run_training_testing.py`
     * Complete training and testing pipeline
     * Configuration management
     * Results logging
-
 2. Complete Implementation Requirements
    - MUST implement EVERY component from model survey notes
    - NO placeholder code (no `pass`, `...`, `raise NotImplementedError`)
    - MUST include complete logic and mathematical operations
    - Each component MUST be fully functional and tested
-
 3. Dataset and Training Requirements
    - Select and download ONE actual dataset from references
    - Implement full data processing pipeline
    - Train for exactly 2 epochs
    - Test model performance after training
    - Log all metrics and results
-
 4. Integration Requirements
    - All components must work together seamlessly
    - Clear dependencies between modules
    - Consistent coding style and documentation
    - Proper error handling and GPU support
-
 EXECUTION WORKFLOW:
 1. Dataset Setup
    - Choose appropriate dataset from references (You MUST use the actual dataset, not the toy or random datasets) [IMPORTANT!!!]
    - Download to data directory `/{workplace_name}/project/data`
    - Implement processing pipeline in `/{workplace_name}/project/data_processing/`
    - Verify data loading
-
 2. Model Implementation
    - Study model survey notes thoroughly
    - Implement each component completely
    - Document mathematical operations
    - Add comprehensive docstrings
-
 3. Training Implementation
    - Complete training loop
    - Loss function implementation
    - Optimization setup
    - Progress monitoring
-
 4. Testing Setup
    - Implement evaluation metrics
    - Create testing procedures
    - Set up results logging
    - Error handling
-
 5. Integration
    - Create run_training_testing.py
    - Configure for 2 epoch training
    - Add GPU support and OOM handling
    - Implement full pipeline execution
-
 VERIFICATION CHECKLIST:
 1. Project Structure
    - All directories exist and are properly organized
    - Each component is in correct location
    - Clear separation of concerns
-
 2. Implementation Completeness
    - Every function is fully implemented
    - No placeholder code exists
    - All mathematical operations are coded
    - Documentation is complete
-
 3. Functionality
    - Dataset downloads and loads correctly
    - Training runs for 2 epochs
    - Testing produces valid metrics
    - GPU support is implemented
-
 Remember: 
 - MUST use actual dataset (no toy data, download according to the reference codebases) [IMPORTANT!!!]
 - Implementation MUST strictly follow model survey notes
@@ -315,42 +352,179 @@ Remember:
 - Project MUST run end-to-end without placeholders
 - MUST complete 2 epochs of training and testing
 """
-        messages = [{"role": "user", "content": ml_dev_query}]
-        ml_dev_messages, context_variables = await self.ml_agent(messages, context_variables)
-        ml_dev_res = ml_dev_messages[-1]["content"]
+        ml_agent_messages_history = [{"role": "user", "content": ml_agent_initial_query}]
+        
+        # MAX_ITER_TIMES is passed as an argument to forward method
+        for i in range(max_iter_times):
+            retry_attempt_for_current_iteration = 0
+            max_retries_for_iteration = 1 # Max retries with rollback for a single iteration i
 
-        query = f"""\
-INPUT:
+            while retry_attempt_for_current_iteration <= max_retries_for_iteration:
+                try:
+                    # --- ML Agent Execution ---
+                    self.logger.info(f"Starting ML Agent iteration {i+1}, attempt {retry_attempt_for_current_iteration + 1}")
+                    use_cache_interactively = (retry_attempt_for_current_iteration == 0)
+                    iter_tag = i + 1 
+        
+                    ml_agent_response_messages, context_variables = await self.ml_agent(
+                        list(ml_agent_messages_history), # Pass a copy to avoid modification issues if agent modifies input list
+                        context_variables, 
+                        iter_times=iter_tag,
+                        interactive_cache_check=use_cache_interactively
+                    )
+                    # Assuming last message is the result and AgentModule appends to its own history for saving
+                    # but returns the new messages part of the conversation for us to manage history.
+                    # For this loop, we need to manage ml_agent_messages_history explicitly.
+                    current_ml_dev_res = ml_agent_response_messages[-1]["content"] 
+                    ml_agent_messages_history.extend(ml_agent_response_messages) # Add ML agent's new messages
+                    self.quality_tracker.reset_consecutive_failures()
+
+                    # --- Judge Agent Execution ---
+                    self.logger.info(f"Starting Judge Agent for iteration {i+1}")
+                    judge_query = f"""INPUT:
 You are given an innovative idea:
 {metadata["task_instructions"]}
 and the reference codebases chosen by the `Prepare Agent`:
 {prepare_res}
 and the detailed coding plan:
-{plan_res}
+{plan_res} 
 The implementation of the project:
-{ml_dev_res}
+{current_ml_dev_res}
 Your task is to evaluate the implementation, and give a suggestion about the implementation. Note that you should carefully check whether the implementation meets the idea, especially the atomic academic concepts in the model survey notes one by one! If not, give comprehensive suggestions about the implementation.
 
 [IMPORTANT] You should fully utilize the existing resources in the reference codebases as much as possible, including using the existing datasets, model components, and training process, but you should also implement the idea by creating new model components!
-
 [IMPORTANT] You should recognize every key point in the innovative idea, and carefully check whether the implementation meets the idea one by one!
-
 [IMPORTANT] Some tips about the evaluation:
 1. The implementation should carefully follow the plan. Please check every component in the plan step by step.
 2. The implementation should have the test process. All in all, you should train ONE dataset with TWO epochs, and finally test the model on the test dataset within one script. The test metrics should follow the plan.
 3. The model should be train on GPU device. If you meet Out of Memory problem, you should try another specific GPU device.
 """
-        input_messages = [{
-            "role": "user",
-            "content": query
-        }]
-        judge_messages, context_variables = await self.judge_agent(input_messages, context_variables)
-        judge_res = judge_messages[-1]["content"]
+                    judge_agent_input_messages = [{"role": "user", "content": judge_query}]
+                    
+                    judge_agent_response_messages, context_variables = await self.judge_agent(
+                        judge_agent_input_messages, 
+                        context_variables, 
+                        iter_times=iter_tag, 
+                        interactive_cache_check=use_cache_interactively 
+                    )
+                    current_judge_res = judge_agent_response_messages[-1]["content"]
+                    ml_agent_messages_history.extend(judge_agent_response_messages) # Add judge's response for next ML call
 
-        MAX_ITER_TIMES = max_iter_times
-        for i in range(MAX_ITER_TIMES):
-            query = f"""\
-You are given an innovative idea:
+                    # --- Robust Parsing of JudgeAgent Output ---
+                    parsed_judge_output = None
+                    is_fully_correct = False
+                    try:
+                        json_str_from_judge = extract_json_from_output(current_judge_res) # Using global helper
+
+                        if json_str_from_judge:
+                            parsed_judge_output = json.loads(json_str_from_judge)
+                            if isinstance(parsed_judge_output, dict) and "fully_correct" in parsed_judge_output:
+                                is_fully_correct = parsed_judge_output.get("fully_correct", False)
+                        else: # Fallback if JSON structure is not found
+                            if '"fully_correct": true' in current_judge_res: # Less reliable check
+                                is_fully_correct = True
+                    except json.JSONDecodeError as json_e:
+                        self.logger.error(f"Failed to parse JSON from JudgeAgent output: {json_e}. Raw output: {current_judge_res}")
+                        is_fully_correct = False # Default to not fully correct
+
+                    if is_fully_correct:
+                        self.quality_tracker.add_quality_score(1.0)
+                        self.logger.info(f"Iteration {i+1} (attempt {retry_attempt_for_current_iteration + 1}) successful and fully correct based on parsed judge output.")
+                        # This break is for the inner retry loop (while loop)
+                        break 
+                    else:
+                        # Using 0.3 as specified for "not fully correct but complete".
+                        self.quality_tracker.add_quality_score(0.3) 
+                        self.logger.warning(f"Iteration {i+1} (attempt {retry_attempt_for_current_iteration + 1}) completed but was not fully correct based on parsed judge output.")
+                        if self.quality_tracker.is_review_triggered(self.smart_config):
+                            self.logger.info("QualityTracker triggered an intelligent review due to low quality score. Invoking QualityAssuranceAgent.")
+                            context_variables["ml_dev_res"] = current_ml_dev_res
+                            context_variables["judge_res"] = current_judge_res
+                            context_variables["quality_tracker_summary"] = {
+                                "consecutive_failures": self.quality_tracker.consecutive_failures,
+                                "latest_quality_score": self.quality_tracker.get_latest_quality_score(),
+                                "compilation_failure_rate": self.quality_tracker.get_compilation_failure_rate()
+                            }
+                            qa_messages_history = [{"role": "user", "content": "An intelligent review has been triggered due to low quality score. Please assess."}]
+                            qa_response_messages, context_variables = await self.quality_assurance_agent(
+                                qa_messages_history, context_variables
+                            )
+                            qa_assessment_res = qa_response_messages[-1]["content"]
+                            self.logger.info(f"Quality Assurance Agent Assessment (low quality): {qa_assessment_res}")
+                            # TODO: Handle QA assessment. May influence retry or stop.
+                    # This break is for the inner retry loop (while loop)
+                    break 
+                except Exception as e:
+                    self.logger.error(f"Error during InnoFlow iteration {i+1} (attempt {retry_attempt_for_current_iteration + 1}): {e}")
+                    self.quality_tracker.increment_consecutive_failures()
+                    
+                    if self.rollback_attempts_left > 0 and self.quality_tracker.is_review_triggered(self.smart_config):
+                        self.rollback_attempts_left -= 1
+                        retry_attempt_for_current_iteration += 1
+                        self.logger.info(f"QualityTracker triggered an intelligent review due to error. Invoking QualityAssuranceAgent.")
+                        # Prepare context for QualityAssuranceAgent
+                        context_variables["ml_dev_res"] = current_ml_dev_res # Might be unset if ML agent itself errored early
+                        context_variables["judge_res"] = current_judge_res # Might be unset if ML agent errored
+                        context_variables["quality_tracker_summary"] = {
+                            "consecutive_failures": self.quality_tracker.consecutive_failures,
+                            "latest_quality_score": self.quality_tracker.get_latest_quality_score(),
+                            "compilation_failure_rate": self.quality_tracker.get_compilation_failure_rate(),
+                            "error_context": str(e) # Add error context for QA
+                        }
+                        qa_messages_history = [{"role": "user", "content": "An intelligent review has been triggered due to an error. Please assess."}]
+                        
+                        qa_response_messages, context_variables_after_qa = await self.quality_assurance_agent(
+                            qa_messages_history,
+                            context_variables 
+                        )
+                        qa_assessment_res = qa_response_messages[-1]["content"]
+                        context_variables = context_variables_after_qa # Update context_variables
+                        self.logger.info(f"Quality Assurance Agent Assessment (error): {qa_assessment_res}")
+                        # TODO: Logic to handle QA assessment. May influence rollback or retry.
+
+                        self.logger.info(f"Attempting rollback. Attempts left: {self.rollback_attempts_left}. Retrying iteration {i+1} (new attempt {retry_attempt_for_current_iteration + 1})")
+                        
+                        # Simplified rollback for ml_agent_messages_history:
+                        # Remove the last two turns (failed ML agent + its preceding user query/judge response)
+                        # This is an approximation. A robust solution would save/load history.
+                        if len(ml_agent_messages_history) >= 2 : # If there was a judge response and then ML agent failed
+                             # Remove judge response and the user query that was based on it
+                            ml_agent_messages_history = ml_agent_messages_history[:-2]
+                        elif len(ml_agent_messages_history) >=1 and ml_agent_messages_history[-1]["role"] == "user": # If ML agent failed on its first turn of this iteration
+                            # This means the initial query for this iteration caused failure.
+                            # We need to ensure the history is reset to before this user query.
+                            # This depends on how history was built. If it's cumulative, this is tricky.
+                            # The provided example query for "next_ml_query" is appended.
+                            # If the very first ml_agent_initial_query fails, history is just that.
+                            # This part needs careful state management of ml_agent_messages_history.
+                            # For the provided example, the user message is added at the end of the loop for the *next* iteration.
+                            # So if ml_agent fails, its input `ml_agent_messages_history` was from the *previous* iteration's end.
+                            # Thus, we might not need to change ml_agent_messages_history here for retry,
+                            # as the agent itself will try to load its *own* cached state from the previous successful step.
+                            self.logger.warning("Simplified rollback: Retrying agent. Agent's own cache will be primary means of its state rollback.")
+                        else: # Fallback if first iteration, first try
+                             ml_agent_messages_history = [{"role": "user", "content": ml_agent_initial_query}]
+
+
+                    else: 
+                        self.logger.error(f"Iteration {i+1} failed. No more rollback attempts or rollback not triggered. Error: {e}")
+                        raise e
+            
+            # Check if current iteration was successful (is_fully_correct would be set from the try block)
+            # This check is for the outer loop (for i in range(max_iter_times))
+            if is_fully_correct:
+                 self.logger.info(f"Task deemed fully correct after iteration {i+1}. Breaking main iteration loop.")
+                 break # Breaks the outer for i in range(max_iter_times) loop
+            else:
+                 # If the inner loop completed (meaning break was hit, either by success or by exhausting retries after an exception)
+                 # but is_fully_correct is false, it means the attempt completed but wasn't "fully_correct".
+                 # Or, if an exception was re-raised, this part won't be reached for this 'i'.
+                 # The logger warning for "not fully correct" is already inside the try block.
+                 pass # Continue to the next iteration of the outer loop or finish if max_iter_times is reached.
+
+
+            if i < max_iter_times - 1:
+                next_ml_query = f"""You are given an innovative idea:
 {metadata["task_instructions"]}
 and the reference codebases chosen by the `Prepare Agent`:
 {prepare_res}
@@ -359,21 +533,16 @@ and the detailed coding plan:
 and the model survey notes you should carefully follow:
 {survey_res}
 And your last implementation of the project:
-{ml_dev_res}
+{current_ml_dev_res}
 The suggestion about your last implementation:
-{judge_res}
+{current_judge_res}
 Your task is to modify the project according to the suggestion. Note that you should MODIFY rather than create a new project! Take full advantage of the existing resources! Still use the SAME DATASET!
 
 [IMPORTANT] You should modify the project in the directory `/{workplace_name}/project`, rather than create a new project!
-
 [IMPORTANT] If you meet dataset missing problem, you should download the dataset from the reference codebases, and put the dataset in the directory `/{workplace_name}/project/data`. 
-
 [IMPORTANT] You CANNOT stop util you 2 epochs of training and testing on your model with the ACTUAL dataset.
-
 [IMPORTANT] You encounter ImportError while using `run_python()`, you should check whether every `__init__.py` file is correctly implemented in the directories in the `/{workplace_name}/project`!
-
 [IMPORTANT] Carefully check whether model and its components are correctly implemented according to the model survey notes!
-
 Remember: 
 - Implementation MUST strictly follow model survey notes
 - ALL components MUST be fully implemented
@@ -381,40 +550,25 @@ Remember:
 - MUST use actual dataset (no toy data)
 - MUST complete 2 epochs of training and testing
 """
-            judge_messages.append({"role": "user", "content": query})
-            judge_messages, context_variables = await self.ml_agent(judge_messages, context_variables, iter_times=i+1)
-            ml_dev_res = judge_messages[-1]["content"]
-            query = f"""\
-You are given an innovative idea:
-{metadata["task_instructions"]}
-and the reference codebases chosen by the `Prepare Agent`:
-{prepare_res}
-and the detailed coding plan:
-{plan_res}
-and the model survey notes you should carefully follow:
-{survey_res}
-The implementation of the project:
-{ml_dev_res}
-Please evaluate the implementation, and give a suggestion about the implementation.
-"""
-            judge_messages.append({"role": "user", "content": query})
-            judge_messages, context_variables = await self.judge_agent(judge_messages, context_variables, iter_times=i+1)
-            judge_res = judge_messages[-1]["content"]
-            if '"fully_correct": true' in judge_messages[-1]["content"]:
-                break   
-
-        # return judge_messages[-1]["content"]
-        # submit the code to the environment -> get the result
-
-
+                # ml_agent_messages_history already contains current_judge_res from judge_agent_response_messages
+                ml_agent_messages_history.append({"role": "user", "content": next_ml_query})
         
+        self.logger.info("--- Initial Implementation & Verification Phase Completed ---")
+        self.logger.info("--- Starting Final Submission Phase ---")
+        
+        # The rest of the forward method (ml_submit_query, exp_analyser calls) starts here.
+        # These are outside the refactored loop for now.
+        # Ensure current_ml_dev_res and current_judge_res have the latest values before this query
+        # If the loop finished due to max_iter_times without full correctness, 
+        # current_ml_dev_res and current_judge_res will hold the last attempt's results.
+        # If it broke due to is_fully_correct, they hold the successful results.
         ml_submit_query = f"""\
 You are given an innovative idea:
 {metadata["task_instructions"]}
 And your last implementation of the project:
-{ml_dev_res}
+{current_ml_dev_res} 
 The suggestion about your last implementation:
-{judge_res}
+{current_judge_res}
 You have run out the maximum iteration times to implement the idea by running the script `run_training_testing.py` with TWO epochs of training and testing on ONE ACTUAL dataset.
 Your task is to submit the code to the environment by running the script `run_training_testing.py` with APPROPRIATE epochs of training and testing on THIS ACTUAL dataset in order to get some stastical results. You must MODIFY the epochs in the script `run_training_testing.py` rather than use the 2 epochs.
 
@@ -424,8 +578,20 @@ Note that if your last implementation is not runable, you should finalize the su
 After you get the result, you should return the result with your analysis and suggestions about the implementation with `case_resolved` function.
 """
         judge_messages.append({"role": "user", "content": ml_submit_query})
+
+        # Update context_variables for ml_agent before this call too
+        if self.code_env: # Potentially refresh GPU info
+            gpu_memory_info = self.code_env.get_gpu_memory_info()
+            # print(f"Retrieved GPU Info (submit): {gpu_memory_info}")
+        context_variables["gpu_memory_info"] = gpu_memory_info
+        context_variables["gpu_memory_threshold"] = self.smart_config.gpu_memory_threshold
+        context_variables["auto_batch_size_adjustment"] = self.smart_config.auto_batch_size_adjustment
+        
         judge_messages, context_variables = await self.ml_agent(judge_messages, context_variables, iter_times="submit")
         submit_res = judge_messages[-1]["content"]
+        self.logger.info(f"Submission Result: {submit_res}") # Existing or similar log
+        self.logger.info("--- Final Submission Phase Completed ---")
+        self.logger.info("--- Starting Experiment Refinement & Analysis Phase ---")
 
         EXP_ITER_TIMES = 2
         for i in range(EXP_ITER_TIMES):
@@ -470,9 +636,20 @@ Your task is to refine the experimental results according to the analysis report
 Note that you should fully utilize the existing code in the directory `/{workplace_name}/project` as much as possible. If you want to add more experiments, you should add the python script in the directory `/{workplace_name}/project/`, like `run_training_testing.py`. Select and output the important results during the experiments into the log files, do NOT output them all in the terminal.
 """
             judge_messages.append({"role": "user", "content": refine_query})
+
+            # Update context_variables for ml_agent before this call too
+            if self.code_env: # Potentially refresh GPU info
+                gpu_memory_info = self.code_env.get_gpu_memory_info()
+                # print(f"Retrieved GPU Info (refine {i+1}): {gpu_memory_info}")
+            context_variables["gpu_memory_info"] = gpu_memory_info
+            context_variables["gpu_memory_threshold"] = self.smart_config.gpu_memory_threshold
+            context_variables["auto_batch_size_adjustment"] = self.smart_config.auto_batch_size_adjustment
+
             judge_messages, context_variables = await self.ml_agent(judge_messages, context_variables, iter_times=f"refine_{i+1}")
             refine_res = judge_messages[-1]["content"]
 
+        self.logger.info("--- Experiment Refinement & Analysis Phase Completed ---")
+        self.logger.info("--- AI Researcher Workflow Finished ---")
 #         print(refine_res)
         
 def main(args):
